@@ -1,0 +1,13 @@
+[package]
+name = "needlecast-common"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+user = ["dep:aya", "dep:serde", "dep:postcard"]
+
+[dependencies]
+aya = { version = "0.13", optional = true }
+serde = { version = "1", features = ["derive", "alloc"], default-features = false, optional = true }
+postcard = { version = "1", features = ["alloc"], default-features = false, optional = true }

@@ -1,0 +1,12 @@
+[build]
+target = "bpfel-unknown-none"
+
+[target.bpfel-unknown-none]
+rustflags = ["-C", "debuginfo=2", "-C", "link-arg=--btf"]
+
+# nixpkgs ships a stable rustc that already has a prebuilt `core` for
+# bpfel-unknown-none, plus a bpf-linker matched to its LLVM. aya-ebpf needs exactly one
+# nightly feature (asm_experimental_arch), so unlocking it here is cheaper than adding a
+# second toolchain and building core from source.
+[env]
+RUSTC_BOOTSTRAP = "1"

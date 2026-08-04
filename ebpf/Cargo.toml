@@ -1,0 +1,22 @@
+[package]
+name = "needlecast-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+needlecast-common = { path = "../crates/common" }
+
+[[bin]]
+name = "needlecast"
+path = "src/main.rs"
+
+[profile.release]
+debug = 2
+lto = true
+panic = "abort"
+opt-level = 3
+codegen-units = 1
+overflow-checks = false
+
+[workspace]
