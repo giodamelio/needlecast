@@ -5,7 +5,7 @@ edition = "2021"
 
 [dependencies]
 aya-ebpf = "0.1"
-needlecast-common = { path = "../crates/common" }
+needlecast-common = { path = "../common" }
 
 [[bin]]
 name = "needlecast"

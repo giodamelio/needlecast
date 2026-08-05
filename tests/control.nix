@@ -1,193 +1,171 @@
 {
   pkgs,
   testers,
-  needlecast-poc,
+  needlecast,
   kernelPackages,
   variant,
 }: let
-  probe = import ./lib/probe.nix {inherit pkgs;};
-  transports = import ./lib/transport.nix {inherit pkgs;};
-  t = transports.wireguard;
-
-  common = {
-    boot.kernelPackages = kernelPackages;
-    networking.firewall.enable = false;
-    virtualisation.vlans = [1];
-    virtualisation.memorySize = 2048;
-    virtualisation.cores = 2;
-    environment.systemPackages = with pkgs; [needlecast-poc probe bpftools iproute2 python3];
-  };
+  s = import ./lib/scenarios.nix {inherit pkgs;};
+  common = s.node {inherit kernelPackages needlecast;};
 in
+  # The control plane's one load-bearing job is liveness: without it the client keeps rewriting
+  # toward a server that is gone, and a connection hangs on SYN retransmit instead of failing.
   testers.runNixOSTest {
     name = "needlecast-control-${variant}";
 
-    nodes.laptop = {...}: {imports = [common t.laptop];};
-    nodes.desktop = {...}: {imports = [common t.desktop];};
+    nodes.server = {...}: common;
+    nodes.client = {...}: common;
 
     testScript = ''
-      IFACE = "${t.iface}"
-      LAPTOP = "${t.laptopAddr}"
-      DESKTOP = "${t.desktopAddr}"
+      ${s.preamble}
       PORT = 8080
       OTHER = 8081
 
       start_all()
-      for m in (laptop, desktop):
+      for m in (server, client):
           m.wait_for_unit("multi-user.target")
-      laptop.wait_until_succeeds(f"ping -c1 -W2 {DESKTOP}", timeout=60)
 
-      def parse(out):
-          d = {}
-          for line in out.strip().splitlines():
-              if "=" in line:
-                  k, v = line.split("=", 1)
-                  d[k] = v
-          return d
+      ${s.assertKernel kernelPackages ["server" "client"]}
 
       def config():
-          return parse(laptop.succeed("needlecast-poc show-config || true"))
-
-      def enabled():
-          return config().get("enabled")
-
-      def local(port, extra=""):
-          return parse(laptop.succeed(
-              f"nc-probe connect --host 127.0.0.1 --port {port} {extra} || true"
-          ))
-
-      def start_sleeve():
-          desktop.succeed(f"sysctl -qw net.ipv4.conf.{IFACE}.route_localnet=1")
-          desktop.succeed("rm -f /run/needlecast-sleeve.ready")
-          desktop.succeed(
-              "systemd-run --unit=sleeve --collect "
-              f"needlecast-poc sleeve --iface {IFACE} --transport-v4 {DESKTOP} "
-              f"--transport-peer-v4 {LAPTOP} --mode rung-b --port-lo 8000 --port-hi 8999"
-          )
-          desktop.wait_until_succeeds("test -e /run/needlecast-sleeve.ready", timeout=30)
-
-      def start_bridge(extra=f"--control {DESKTOP}"):
-          laptop.succeed("systemctl stop bridge.service 2>/dev/null || true")
-          laptop.succeed("rm -f /run/needlecast-poc.ready")
-          laptop.succeed(
-              "systemd-run --unit=bridge --collect "
-              f"needlecast-poc run --target-v4 {DESKTOP} {extra} "
-              "--port-lo 8000 --port-hi 8999"
-          )
-          laptop.wait_until_succeeds("test -e /run/needlecast-poc.ready", timeout=30)
+          return parse(client.succeed("needlecast dev show-config || true"))
 
       def advertised():
-          out = laptop.succeed(
-              "bpftool map dump pinned /sys/fs/bpf/needlecast/DESKTOP_PORTS"
+          out = client.succeed(
+              "bpftool map dump pinned /sys/fs/bpf/needlecast/client/DESKTOP_PORTS"
           )
           return out.count("key")
 
-      with subtest("the bridge starts disabled and stays that way until the desktop answers"):
-          start_bridge()
-          assert enabled() == "0", config()
-          # Nothing is rewritten while disabled, so this is stock behaviour.
-          r = local(PORT, "--timeout 5")
+      with subtest("the client starts disabled and stays that way until the server answers"):
+          start_client(client, peer="server")
+          assert config().get("enabled") == "0", config()
+          # Nothing is rewritten while disabled, so this is stock behaviour: an instant, correct
+          # refusal rather than a hang.
+          r = local(client, PORT, "--timeout 5")
           assert r.get("error") == "ECONNREFUSED", r
-          print("no desktop: " + str(config()))
+          print("no server: " + str(config()))
 
-      with subtest("bringing the desktop up enables the bridge on its own"):
-          desktop.succeed(
-              f"systemd-run --unit=dev --collect "
-              f"nc-probe serve --bind 127.0.0.1 --port {PORT} --token desktop"
-          )
-          desktop.wait_until_succeeds(f"ss -lnt | grep -q '127.0.0.1:{PORT}'", timeout=30)
-          start_sleeve()
-          laptop.wait_until_succeeds(
-              "needlecast-poc show-config | grep -q 'enabled=1'", timeout=30
-          )
-          r = local(PORT)
-          assert r.get("data") == "desktop", r
+      with subtest("bringing the server up enables the client on its own"):
+          serve(server, "dev", PORT, "server-side")
+          server.wait_until_succeeds(f"ss -lnt | grep -q '127.0.0.1:{PORT}'", timeout=30)
+          start_server(server, peer="client")
+          wait_enabled(client)
+          r = local(client, PORT)
+          assert r.get("data") == "server-side", r
 
-      with subtest("the listener set arrives, and gates ports the desktop does not serve"):
-          before = parse(laptop.succeed("needlecast-poc counters || true"))
-          r = local(OTHER, "--timeout 5")
+      with subtest("the managed range comes from the server, not from a flag on this side"):
+          # The client is never told a range; it adopts whatever the server says it serves.
+          cfg = config()
+          assert cfg.get("port_lo") == str(PORT_LO), cfg
+          assert cfg.get("port_hi") == str(PORT_HI), cfg
+
+      with subtest("the listener set gates ports the server does not serve"):
+          before = counters(client, "counters")
+          r = local(client, OTHER, "--timeout 5")
           assert r.get("error") == "ECONNREFUSED", r
-          after = parse(laptop.succeed("needlecast-poc counters || true"))
-          na = int(after.get("connect4.not_advertised", 0)) - int(
-              before.get("connect4.not_advertised", 0))
+          after = counters(client, "counters")
+          na = after.get("connect4.not_advertised", 0) - before.get("connect4.not_advertised", 0)
           print(f"connect4.not_advertised +{na}")
           assert na >= 1, (before, after)
 
-      with subtest("a port appearing on the desktop becomes usable without restarting anything"):
-          desktop.succeed(
-              f"systemd-run --unit=dev2 --collect "
-              f"nc-probe serve --bind 127.0.0.1 --port {OTHER} --token desktop2"
+      with subtest("a port appearing on the server becomes usable without restarting anything"):
+          serve(server, "dev2", OTHER, "server-two")
+          server.wait_until_succeeds(f"ss -lnt | grep -q '127.0.0.1:{OTHER}'", timeout=30)
+          client.wait_until_succeeds(
+              f"nc-probe connect --host 127.0.0.1 --port {OTHER} | grep -q server-two", timeout=30
           )
-          desktop.wait_until_succeeds(f"ss -lnt | grep -q '127.0.0.1:{OTHER}'", timeout=30)
-          laptop.wait_until_succeeds(
-              f"nc-probe connect --host 127.0.0.1 --port {OTHER} | grep -q desktop2", timeout=30
-          )
-          print("new desktop port became usable")
+          print("a new server port became usable")
 
       with subtest("a port disappearing stops being forwarded"):
-          desktop.succeed("systemctl stop dev2.service")
-          desktop.wait_until_fails(f"ss -lnt | grep -q '127.0.0.1:{OTHER}'", timeout=30)
-          print("desktop now serves: " + desktop.succeed("needlecast-poc listeners | tr '\n' ' '"))
+          server.succeed("systemctl stop dev2.service")
+          server.wait_until_fails(f"ss -lnt | grep -q '127.0.0.1:{OTHER}'", timeout=30)
+          print("the server now serves: " + server.succeed("needlecast dev listeners | tr '\n' ' '"))
           import time as _t
           for _ in range(30):
-              r = local(OTHER, "--timeout 5")
+              r = local(client, OTHER, "--timeout 5")
               if r.get("error"):
                   break
               _t.sleep(1)
           print(f"after withdrawal: {r}  advertised entries: {advertised()}")
           assert r.get("error") == "ECONNREFUSED", r
 
-      with subtest("killing the sleeve disables the bridge and clears the listener set"):
-          desktop.succeed("systemctl stop sleeve.service")
-          laptop.wait_until_succeeds(
-              "needlecast-poc show-config | grep -q 'enabled=0'", timeout=30
+      with subtest("killing the server disables the client and clears the listener set"):
+          server.succeed("systemctl stop ncserver.service")
+          client.wait_until_succeeds(
+              "needlecast dev show-config | grep -q 'enabled=0'", timeout=60
           )
           # Cleared, not left stale: a stale set is worse than none.
-          assert advertised() == 0, "listener set not cleared on disconnect"
-          r = local(PORT, "--timeout 5")
+          assert advertised() == 0, "the listener set was not cleared on disconnect"
+          r = local(client, PORT, "--timeout 5")
           assert r.get("error") == "ECONNREFUSED", r
 
-      with subtest("the bridge reconnects on its own when the desktop returns"):
-          start_sleeve()
-          laptop.wait_until_succeeds(
-              "needlecast-poc show-config | grep -q 'enabled=1'", timeout=60
+      with subtest("the client reconnects on its own when the server returns"):
+          start_server(server, peer="client")
+          wait_enabled(client)
+          r = local(client, PORT)
+          assert r.get("data") == "server-side", r
+
+      with subtest("TCP_SYNCNT is applied to rewritten sockets, and only to those"):
+          before = counters(client, "counters")
+          local(client, PORT)
+          after = counters(client, "counters")
+          ok = after.get("connect4.setsockopt_ok", 0) - before.get("connect4.setsockopt_ok", 0)
+          err = after.get("connect4.setsockopt_err", 0) - before.get("connect4.setsockopt_err", 0)
+          rewritten = after.get("connect4.rewritten", 0) - before.get("connect4.rewritten", 0)
+          print(f"rewritten +{rewritten}, setsockopt ok +{ok} err +{err}")
+          assert ok == rewritten and err == 0, (before, after)
+
+      # The heartbeat is fast only while something is riding the tunnel, because that is when a
+      # stale enabled flag costs something. Holding a connection open is what makes it speed up,
+      # and is also what makes the next subtest measurable in seconds rather than half a minute.
+      with subtest("the heartbeat speeds up while a connection is open"):
+          serve(server, "held", 8088, "held-open", "--hold 120")
+          server.wait_until_succeeds("ss -lnt | grep -q '127.0.0.1:8088'", timeout=30)
+          client.wait_until_succeeds(
+              "needlecast status --role client | grep -q 'server_listeners=.*8088'", timeout=30
           )
-          r = local(PORT)
-          assert r.get("data") == "desktop", r
+          client.succeed("rm -f /tmp/held.out")
+          client.succeed(
+              "setsid nc-probe connect --host 127.0.0.1 --port 8088 --hold 90 "
+              "> /tmp/held.out 2>&1 &"
+          )
+          client.wait_until_succeeds("grep -q '^data=' /tmp/held.out", timeout=20)
+          # `status` reports the flow, which is the same reading the heartbeat uses to decide.
+          out = client.succeed("needlecast status --role client")
+          print(out)
+          assert "forwarded=" in out, out
 
-      with subtest("TCP_SYNCNT is applied to rewritten sockets"):
-          before = parse(laptop.succeed("needlecast-poc counters || true"))
-          local(PORT)
-          after = parse(laptop.succeed("needlecast-poc counters || true"))
-          ok = int(after.get("connect4.setsockopt_ok", 0)) - int(
-              before.get("connect4.setsockopt_ok", 0))
-          err = int(after.get("connect4.setsockopt_err", 0)) - int(
-              before.get("connect4.setsockopt_err", 0))
-          print(f"setsockopt ok +{ok} err +{err}")
-          assert ok >= 1 and err == 0, (before, after)
+      # If either half of this failed, the control plane would be forwarding itself.
+      with subtest("the control connection is never itself forwarded"):
+          import time as _t
+          # The server's tc ingress skips it as out of range, which is visible as a rising counter
+          # while the heartbeat runs — and it is running once a second now.
+          b = counters(server, "tc-counters")
+          _t.sleep(6)
+          a = counters(server, "tc-counters")
+          delta = a.get("tc_ingress.port_out_of_range", 0) - b.get(
+              "tc_ingress.port_out_of_range", 0)
+          print(f"tc_ingress.port_out_of_range +{delta} while the heartbeat ran")
+          assert delta >= 1, (b, a)
 
-      # The window the cap exists for: the desktop is gone but the heartbeat has not noticed. Run
-      # without a control plane so `enabled` stays set, which is the only way to hold the window
-      # open long enough to measure it.
-      with subtest("TCP_SYNCNT bounds how long a connection to a vanished desktop hangs"):
-          desktop.succeed(f"ip link set {IFACE} down")
-
-          def time_connect(syncnt):
-              start_bridge(f"--syncnt {syncnt}")
-              t0 = int(laptop.succeed("date +%s").strip())
-              r = local(PORT, "--timeout 120")
-              t1 = int(laptop.succeed("date +%s").strip())
-              return t1 - t0, r
-
-          low, r_low = time_connect(1)
-          high, r_high = time_connect(4)
-          print(f"syncnt=1 took {low}s ({r_low}); syncnt=4 took {high}s ({r_high})")
-          # Both must fail rather than hang forever, and the knob must visibly move the deadline —
-          # otherwise the cap is not actually being applied.
-          assert low < 30, f"syncnt=1 took {low}s"
-          assert high > low, f"syncnt=4 ({high}s) should exceed syncnt=1 ({low}s)"
-          desktop.succeed(f"ip link set {IFACE} up")
+          # And the client declines it as non-loopback rather than rewriting it. Measured across a
+          # fresh reconnect, since that is when the control socket is actually created — so the
+          # window has to contain a real disconnect, not merely a fast server restart.
+          before = counters(client, "counters")
+          server.succeed("systemctl stop ncserver.service")
+          client.wait_until_succeeds(
+              "needlecast dev show-config | grep -q 'enabled=0'", timeout=60
+          )
+          start_server(server, peer="client")
+          wait_enabled(client)
+          after = counters(client, "counters")
+          nl = after.get("connect4.not_loopback", 0) - before.get("connect4.not_loopback", 0)
+          rw = after.get("connect4.rewritten", 0) - before.get("connect4.rewritten", 0)
+          print(f"across a reconnect: not_loopback +{nl}, rewritten +{rw}")
+          assert nl >= 1, (before, after)
+          assert rw == 0, "the control connection was rewritten"
 
       with subtest("final config"):
-          print(laptop.succeed("needlecast-poc show-config"))
+          print(client.succeed("needlecast dev show-config"))
     '';
   }

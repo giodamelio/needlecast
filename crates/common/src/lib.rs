@@ -1,7 +1,11 @@
-#![no_std]
+// `no_std` for the BPF target, but the test harness needs std to run, and the predicates in `net`
+// are the part of this crate most worth testing.
+#![cfg_attr(not(test), no_std)]
 
-#[cfg(feature = "user")]
+#[cfg(all(feature = "user", not(test)))]
 extern crate std;
+
+pub mod net;
 
 #[cfg(feature = "user")]
 pub mod proto;
@@ -56,6 +60,9 @@ pub mod ev {
     pub const SETSOCKOPT_OK: u32 = 10;
     pub const SETSOCKOPT_ERR: u32 = 11;
     pub const NETNS_COOKIE_UNAVAILABLE: u32 = 12;
+    /// The destination is IPv6 but no IPv6 tunnel address is configured, so there is nowhere to
+    /// send it. Rewriting to the unspecified address would be worse than declining.
+    pub const NO_V6_TARGET: u32 = 13;
     pub const COUNT: u32 = 16;
 }
 
@@ -79,7 +86,7 @@ pub const EV_NAMES: [&str; ev::COUNT as usize] = [
     "setsockopt_ok",
     "setsockopt_err",
     "netns_cookie_unavailable",
-    "-",
+    "no_v6_target",
     "-",
     "-",
 ];
@@ -95,18 +102,7 @@ pub const PROG_NAMES: [&str; prog::COUNT as usize] = [
     "recvmsg6",
 ];
 
-/// How the desktop delivers a forwarded flow.
-pub mod mode {
-    /// Rewrite the destination inbound and the source outbound. The server sees the laptop's
-    /// tunnel address as its peer.
-    pub const RUNG_A: u8 = 0;
-    /// Same on the wire, plus a `cgroup/getpeername4` program that reports the peer as
-    /// `127.0.0.1` — so the server cannot distinguish the connection from a local one. Symmetric
-    /// with what the laptop does to hide its own rewrite from the client.
-    pub const RUNG_B: u8 = 1;
-}
-
-/// Desktop-side configuration, shared with the tc programs.
+/// Server-side configuration, shared with the tc programs.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SleeveConfig {
@@ -116,15 +112,18 @@ pub struct SleeveConfig {
     pub transport_peer_v4: u32,
     /// Where inbound packets are delivered, and what the peer is reported as. `127.0.0.1`.
     pub local_v4: u32,
+    /// The v6 counterparts. Unused while the desktop datapath is IPv4-only; declared now so adding
+    /// v6 is new code rather than a layout change to a struct BPF and userspace both depend on.
     pub transport_v6: [u32; 4],
+    pub transport_peer_v6: [u32; 4],
     pub local_v6: [u32; 4],
     pub port_lo: u16,
     pub port_hi: u16,
     /// Offset of the IP header within the skb: 14 on an Ethernet-framed device, 0 on an L3-only
     /// one such as a WireGuard interface.
     pub l3_offset: u16,
-    pub mode: u8,
     pub enabled: u8,
+    pub _pad: u8,
 }
 
 #[cfg(feature = "user")]
@@ -134,7 +133,10 @@ pub mod tc {
     pub const INGRESS: u32 = 0;
     pub const EGRESS: u32 = 1;
     pub const GETPEERNAME: u32 = 2;
-    pub const COUNT: u32 = 3;
+    /// Reserved. Counters are indexed `prog * tcev::COUNT + ev`, so leaving room for the v6
+    /// program now costs one unused row and saves reindexing every existing counter later.
+    pub const GETPEERNAME6: u32 = 3;
+    pub const COUNT: u32 = 4;
 }
 
 pub mod tcev {
@@ -179,5 +181,9 @@ pub const TCEV_NAMES: [&str; tcev::COUNT as usize] = [
     "-",
 ];
 
-pub const TC_PROG_NAMES: [&str; tc::COUNT as usize] =
-    ["tc_ingress", "tc_egress", "sleeve_getpeername4"];
+pub const TC_PROG_NAMES: [&str; tc::COUNT as usize] = [
+    "tc_ingress",
+    "tc_egress",
+    "sleeve_getpeername4",
+    "sleeve_getpeername6",
+];

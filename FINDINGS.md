@@ -1,26 +1,57 @@
-# Findings: Phases 1 through 9
+# Findings
 
-What the proof of concepts established, as opposed to what [PLAN.md](PLAN.md) assumed. Everything
-here was observed in NixOS VM tests, not reasoned about.
+What was observed, as opposed to what [PLAN.md](PLAN.md) assumed. Everything here was measured in
+NixOS VM tests or Rust unit tests, not reasoned about.
 
 ```
-nix flake check
+nix flake check                        # every VM suite, both kernels
+cargo nextest run --workspace          # the unit and integration tests, in under a second
+cargo nextest run --profile vm         # the same VM suites, one test per suite
+cargo nextest run --profile vm -E 'test(endtoend)'   # or just one of them
 ```
 
-Fourteen VM tests run: seven suites on **6.18.41** (the target kernel, and the nixpkgs LTS) and on
-**7.1.5** (`linuxPackages_latest`, a forward-compatibility check). Every finding holds identically
-on both. Each test asserts the kernel it booted, so a passing run is unambiguous about what it
-proved.
+The unit tests also run inside the package build, so a broken predicate fails `nix build` rather
+than waiting for someone to run them by hand. The `vm` binary is excluded there — it shells out to
+`nix build`, which cannot happen inside a sandbox.
 
-| Suite | Nodes | Covers |
-|---|---|---|
-| `phase2` | 1 | The laptop decision path: `connect4/6`, `getpeername4/6`, `sendmsg4/6`, `recvmsg4/6` |
-| `isolation` | 1 | Containers, manual netns, `PrivateNetwork`, plus negative controls |
-| `desktop-ethernet` | 2 | The desktop datapath over plain ethernet |
-| `desktop-wireguard` | 2 | The same assertions over a real WireGuard tunnel |
-| `endtoend` | 2 | Both halves together: `localhost:8080` on the laptop reaching the desktop |
-| `control` | 2 | Liveness, the listener feed, and the `TCP_SYNCNT` cap |
-| `hostile` | 2 | Local takeover, clean failure, non-interference, protocol fidelity, load |
+Twenty-three VM tests run: eleven suites on **6.18.41** (the target kernel, and the nixpkgs LTS) and
+on **7.1.5** (`linuxPackages_latest`, a forward-compatibility check), plus `demo` on the target
+kernel only. Every finding holds identically on both. Each test asserts the kernel it booted, so a
+passing run is unambiguous about what it proved.
+
+Eight suites drive the **shipped** binary — a secret file and a machine name, nothing else — so no
+feature-gated code can be load bearing for anything they prove.
+
+| Suite | Build | Nodes | Covers |
+|---|---|---|---|
+| `transport` | shipped | 2 | needlecast creating and owning `needle` from nothing but a secret |
+| `endtoend` | shipped | 2 | Both halves together: `localhost:8080` on the client reaching the server |
+| `control` | shipped | 2 | Liveness, the listener feed, the adaptive heartbeat, `TCP_SYNCNT` |
+| `hostile` | shipped | 2 | Local takeover, clean failure, non-interference, protocol fidelity, load |
+| `status` | shipped | 2 | All four states, each reached for real |
+| `resilience` | shipped | 2 | Peer death and return, endpoint re-resolution, crash-and-adopt, idle reaping |
+| `module` | shipped | 2 | The NixOS module: units, credentials, firewall rules |
+| `demo` | shipped | 2 | The whole thing working, and nothing else — the one you boot to look around |
+| `laptop` | testing | 1 | The client decision path: `connect4/6`, `getpeername4/6`, `sendmsg4/6`, `recvmsg4/6` |
+| `isolation` | testing | 1 | Containers, manual netns, `PrivateNetwork`, plus negative controls |
+| `datapath-ethernet` | testing | 2 | The server datapath over plain ethernet |
+| `datapath-wireguard` | testing | 2 | The same assertions over a real WireGuard tunnel |
+
+`demo` is the odd one out on purpose: it asserts almost nothing, because its job is to be booted.
+
+```
+nix run .#demo
+>>> start_all()
+
+nix run .#demo-ssh -- client            # from another terminal, key-only root shell
+nix run .#demo-ssh -- client curl -sf http://localhost:8080/hello.txt
+```
+
+Two things it taught, both of which would have made it useless at the moment you reached for it:
+the test framework gives root an empty `hashedPasswordFile` that silently overrides `password`, so
+password login can never work and the key has to be an `authorizedKeys` entry; and the interactive
+driver does **not** run the test script, so anything the script creates does not exist when you boot
+it by hand. The file the demo serves is declared in the unit instead.
 
 ## Headline
 
@@ -218,7 +249,7 @@ One implementation note that cost a test cycle: the tc programs must treat Rung 
 Rung A. Gating them on `mode != RUNG_A` broke the datapath, because ingress started rewriting the
 source for the one mode whose entire point is not to.
 
-### Rung C is rejected### Rung C is rejected### Rung C is rejected: redirecting into `lo` needs *more* sysctls, not fewer
+### Rung C is rejected: redirecting into `lo` needs *more* sysctls, not fewer
 
 The design conversation claimed that ending the ingress program with
 `bpf_redirect(lo_ifindex, BPF_F_INGRESS)` would avoid `route_localnet` entirely, because "the packet
@@ -403,6 +434,135 @@ which is exactly how a timing flake disguises itself as a kernel difference.
 
 ---
 
+# The real build
+
+Everything above proves a mechanism with the harness doing the setup. This is what changed when the
+daemon started doing its own.
+
+### The identity needs no pairing step, and that is checkable
+
+Both keypairs come from `HKDF-SHA256(secret, "needlecast {server,client} key v1")`, so each machine
+computes both and keeps a different one. Verified three ways rather than assumed:
+
+- against an independent HKDF-SHA256 implementation,
+- against the real `wg pubkey`, which is what proves X25519 clamping here matches WireGuard's,
+- and in `tests/transport.nix`, which asserts the interface carries exactly the derived key.
+
+```
+$ needlecast keys ./secret
+server ZVnbvcoGI3M2tQwGjUgMjlpUh7hRAZ6ve0/6iCJ0Y3Y=
+client quNwuLJbIui3Quc9cqyXZEbtE22/YzLyou6PbbhKw1I=
+```
+
+Running that on both machines is a one-command check for the failure that would otherwise present
+only as a handshake that never completes.
+
+### Replacing a leftover interface beats adopting it
+
+`create_interface` in `defguard_wireguard_rs` already swallows `EEXIST`, so adoption is free — but
+it adopts whatever state the crash left, including a link someone downed and a stale peer set.
+needlecast removes and recreates instead. It costs one handshake, it is deterministic, and the
+interface is ours alone so nothing else can be disturbed by it. `tests/resilience.nix` kills each
+half with `SIGKILL`, asserts the interface survived, and asserts the restart recovers.
+
+### The endpoint really does have to be re-resolved
+
+The `wg-quick` footgun, exercised by moving the peer's name to a dead address and back. The tunnel
+stays down for as long as the name is wrong and recovers on its own when it is fixed — which is
+what makes the recovery attributable to re-resolution rather than to ordinary retrying.
+
+One detail fell out of that test: the NixOS framework publishes both an A and an AAAA for each
+machine, and `getent hosts` answers with the v6 one. needlecast prefers the A record, because the
+tunnel's own addressing is v4-only and a machine that publishes an AAAA it cannot be reached over
+would otherwise leave the handshake failing with nothing to point at.
+
+### The version check cannot be a postcard message
+
+Postcard is non-self-describing, so a frame from a different schema decodes as *something* rather
+than failing. A version field inside the first message is therefore unreadable exactly when it
+matters. The handshake is eight raw bytes — `NDLC` plus a big-endian version — ahead of any framing,
+and both sides send before either compares, so each can name the other's version in its error.
+
+Exit code 78 (`EX_CONFIG`) on mismatch, which `nix/module.nix` names in
+`RestartPreventExitStatus=` so the failure is loud and *stationary* rather than a crash loop.
+
+### The firewall was a real gap the POC could not have found
+
+Every POC suite ran with the firewall off. With it on, the server drops both the control connection
+and the forwarded SYNs — inbound-initiated, so conntrack's `RELATED,ESTABLISHED` accept does not
+help. Something has to open them.
+
+The first attempt got this wrong twice, and both mistakes are worth keeping:
+
+**Hand-written `iptables` and `nftables` rules, branched on which backend was enabled.** Unnecessary:
+`networking.firewall.interfaces.<iface>.allowedTCPPortRanges` says the same thing in ordinary
+options, works whichever backend you run, and translates to one sentence for a machine that is not
+NixOS.
+
+**And the rule it wrote was a hole.** It matched on destination address:
+
+```
+-A nixos-fw -d 127.0.0.0/8 -i needle -j nixos-fw-accept
+```
+
+which accepts *any* port on the tunnel interface so long as the destination is loopback. tc ingress
+only rewrites packets addressed to the tunnel address on a port in the managed range — so a peer
+crafting a packet addressed straight to `127.0.0.1:5432` would have been accepted by that rule and
+delivered by `route_localnet`, reaching a database the range was supposed to keep out of reach. The
+rule written to preserve "the range is the only limit" was the thing that broke it.
+
+Matching on **port** instead is both simpler and strictly tighter. Ports are never translated, so
+the destination port of a forwarded packet is the one the client asked for, and the managed range is
+exactly the right filter:
+
+```nix
+networking.firewall.interfaces.needle = {
+  allowedTCPPorts = [ controlPort ];
+  allowedTCPPortRanges = [ range ];
+  allowedUDPPortRanges = [ range ];
+};
+```
+
+`tests/module.nix` asserts the negative directly: a service bound to `0.0.0.0` on a port outside the
+range is not reachable over the tunnel. Without that, `trustedInterfaces = [ "needle" ]` would have
+passed every other assertion in the file.
+
+### The adaptive heartbeat is measurable rather than theoretical
+
+One packet per second while `/proc/net/tcp` shows a flow to the peer, one per thirty seconds when it
+does not. The liveness deadline is three intervals, so it tightens and relaxes with it — and the
+one ordering hazard, that relaxing the interval must not retroactively expire a healthy connection,
+is unit tested rather than argued.
+
+The server's own idle timeout is two minutes, a generous multiple of the slowest heartbeat.
+`tests/resilience.nix` `SIGSTOP`s the client and watches the server close the stalled connection,
+which is the case that would otherwise be reaped only by TCP keepalive's two-hour default.
+
+### The SYN cap was on one path out of three
+
+`TCP_SYNCNT` was applied in `decide_v4` and nowhere else. That is wrong twice over, and both halves
+showed up only once the client stopped being a test harness:
+
+- **A dual-stack program asking for `localhost` never reaches `connect4`.** It gets
+  `::ffff:127.0.0.1` and arrives in `connect6`, so exactly the programs most likely to be used —
+  anything on a runtime that prefers `AF_INET6` sockets — were getting the stock two-minute hang
+  when the server vanished between heartbeats.
+- **`TCP_SYNCNT` is meaningless on a UDP socket.** `sendmsg4` was calling it per datagram, so
+  `setsockopt_err` climbed steadily during any UDP traffic and would have buried a real failure.
+
+Both are now asserted rather than assumed: `tests/laptop.nix` checks that a mapped-v6 rewrite gets
+exactly one `setsockopt_ok`, and that an unconnected UDP datagram gets neither an ok nor an err.
+
+### Pure logic moved where it could be tested
+
+The BPF crate only builds for `bpfel-unknown-none` and cannot run a test. Every predicate that needs
+no kernel context — the loopback tests, IPv4-mapped detection, the fragment test, header offsets,
+the counter index arithmetic — now lives in `crates/common/src/net.rs` and is unit tested on the
+host. Two of those have a wrong answer that corrupts only large or only dual-stack traffic, which is
+precisely the kind of bug that survives to production.
+
+---
+
 # Toolchain
 
 Three planned dependencies turned out to be unnecessary. PLAN.md called for `fenix` or
@@ -413,14 +573,14 @@ Three planned dependencies turned out to be unnecessary. PLAN.md called for `fen
 `build-std`, and with it the vendoring problem that was the reason to reach for crane.
 
 **aya-ebpf needs exactly one nightly feature** (`asm_experimental_arch`). `RUSTC_BOOTSTRAP=1` in
-`ebpf/.cargo/config.toml` unlocks it. This is a deliberate trade: nixpkgs' `bpf-linker` is built
+`crates/ebpf/.cargo/config.toml` unlocks it. This is a deliberate trade: nixpkgs' `bpf-linker` is built
 against the same LLVM as nixpkgs' rustc, and a fenix nightly would break that pairing and drag
 `build-std` back in to compile `core` for a target it does not ship.
 
 So the flake gained one package, `bpf-linker`, and nothing else. Both derivations are plain
 `stdenv.mkDerivation` plus `rustPlatform.importCargoLock`, with no extra flake inputs.
 
-One nix gotcha: `rustPlatform.cargoSetupHook` preserves `ebpf/.cargo/config.toml` rather than
+One nix gotcha: `rustPlatform.cargoSetupHook` preserves `crates/ebpf/.cargo/config.toml` rather than
 replacing it, so setting `CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS` on the derivation *added* a
 second `--btf` and bpf-linker rejected the duplicate. Let the config file own the rustflags.
 
@@ -438,7 +598,7 @@ Aya ships `include_bytes_aligned!` for precisely this, wrapping the bytes in a `
 struct.
 
 **This is no longer intermittent, and that claim is tested rather than argued.**
-`needlecast-poc alignment-check` proves both halves:
+`needlecast dev alignment-check` proves both halves:
 
 ```
 align_32_offset=0
@@ -548,54 +708,85 @@ node at itself and the handshake silently never completed. Machine *names* resol
 
 # What is in the repo
 
+Every crate lives under `crates/`. `crates/ebpf` is its own cargo workspace rather than a member of
+the root one: it builds for `bpfel-unknown-none`, so it needs its own lockfile and its own
+`.cargo/config.toml`, and an empty `[workspace]` table is how a crate opts out of the enclosing one.
+
+Each BPF program is self-contained in its own file; the plumbing they share is in named modules,
+and every predicate that needs no kernel context lives in `crates/common/src/net.rs` where it can
+be unit tested on the host.
+
 ```
-ebpf/src/main.rs         9 cgroup_sock_addr programs: the laptop decision path
-ebpf/src/tc.rs           2 classifier programs: the desktop datapath
-crates/common/           Config, SleeveConfig, counter indices; no_std, shared both directions
-crates/poc/              loader + control CLI (run, sleeve, counters, tc-counters, set-enabled,
-                         advertise, probe-syncnt, verify-object, alignment-check, netns-cookie)
-nix/ebpf.nix             BPF object derivation
-nix/poc.nix              userspace derivation, receives the .o via NEEDLECAST_EBPF_OBJ
-tests/lib/nodes.nix      shared single-node machine definition, parameterised by kernel
+crates/ebpf/src/main.rs          module declarations and the panic handler, nothing else
+crates/ebpf/src/maps.rs          every map, declared once, plus the counter helpers
+crates/ebpf/src/sock.rs          raw `cgroup_sock_addr` access; the unsafe helper bindings live here
+crates/ebpf/src/packet.rs        IPv4 parsing and rewriting from a tc context: L3 offset, fragments, csums
+crates/ebpf/src/decide.rs        the client's decision policy, shared by connect and sendmsg
+crates/ebpf/src/restore.rs       the client's undo policy, shared by getpeername and recvmsg
+crates/ebpf/src/connect.rs       connect4, connect6
+crates/ebpf/src/sendmsg.rs       sendmsg4, sendmsg6
+crates/ebpf/src/getpeername.rs   getpeername4, getpeername6
+crates/ebpf/src/recvmsg.rs       recvmsg4, recvmsg6
+crates/ebpf/src/tc_ingress.rs    tc_ingress
+crates/ebpf/src/tc_egress.rs     tc_egress
+crates/ebpf/src/sleeve_peer.rs   sleeve_getpeername4
+crates/ebpf/src/syncnt_probe.rs  connect4_syncnt_probe, an isolated capability probe
+
+crates/common/src/net.rs    loopback and fragment predicates, header offsets; unit tested
+crates/common/src/lib.rs    Config, SleeveConfig, counter indices; no_std, shared both directions
+crates/common/src/proto.rs  the wire protocol, the magic, and the version-mismatch exit code
+
+crates/needlecast/src/main.rs       the CLI: server, client, status, keys, dev
+crates/needlecast/src/identity.rs   HKDF-SHA256 derivation of both keypairs from one secret
+crates/needlecast/src/transport.rs  the `needle` interface: create, configure, re-resolve, remove
+crates/needlecast/src/server.rs     the datapath half
+crates/needlecast/src/client.rs     the decision half and its state machine
+crates/needlecast/src/control.rs    liveness, the listener feed, the adaptive heartbeat
+crates/needlecast/src/status.rs     kernel and filesystem state, no IPC
+crates/needlecast/src/wake.rs       resume and network-change detection
+crates/needlecast/src/shutdown.rs   signal handling, so a clean exit removes the interface
+crates/needlecast/src/harness.rs    test scaffolding, only with `--features testing`
+crates/needlecast/tests/handshake.rs  the version preamble, from both directions
+crates/needlecast/tests/vm.rs         every VM suite, as a test nextest can run
+
+nix/ebpf.nix         BPF object derivation
+nix/needlecast.nix   userspace derivation; `testing ? false` selects the two builds
+nix/module.nix       services.needlecast.{server,client}
+tests/lib/scenarios.nix  the shared node definition and the Python helpers every suite uses
 tests/lib/probe.nix      socket probe: which server answered, what getpeername says, bulk and
                          large-datagram modes, --gate for mid-flow changes
-tests/lib/transport.nix  ethernet and WireGuard link definitions with matching addressing
-crates/poc/src/control.rs the control plane: liveness, listener feed, both ends
-crates/common/src/proto.rs the wire protocol
-tests/phase2.nix         the laptop decision path
-tests/isolation.nix      containers, netns, PrivateNetwork, negative controls
-tests/desktop.nix        the desktop datapath, run over both transports
-tests/endtoend.nix       both halves together
-tests/control.nix        liveness, listener feed, TCP_SYNCNT
-tests/hostile.nix        the regression suite
-tests/default.nix        cross-product of every suite with both kernels
+tests/lib/transport.nix  ethernet and WireGuard link definitions, for the harness suites only
 ```
 
 ---
 
 # Still open
 
-**The daemon does not do its own setup.** The test harness creates `wg0`, sets
-`net.ipv4.conf.wg0.route_localnet=1`, and hardcodes the WireGuard keys. Nothing creates the
-interface over netlink, manages the sysctl, or pairs two machines. That is the largest remaining
-gap between this and something installable.
+- **IPv6 on the server datapath.** The tc programs count IPv6 and pass it through, and there is no
+  `sleeve_getpeername6`. The client side is complete. Room is reserved so adding it is new code
+  rather than a layout change: `SleeveConfig` carries the v6 fields, `tc::COUNT` leaves a slot for
+  the v6 program, and `transport::Plan` holds both families.
 
-**No IPv6 on the desktop datapath.** The tc programs count IPv6 packets and pass them through
-untouched, and there is no `getpeername6` on the desktop side. The laptop has full v6 coverage.
+  One correctness consequence was found while wiring the real client: with no v6 tunnel address,
+  `connect6` would have rewritten `::1` to the *unspecified* address, sending the connection nowhere
+  while looking like it worked. It now declines and counts `no_v6_target` instead.
 
-**The desktop's port allowlist is negotiated but not enforced.** `Welcome` carries the range and
-the tc programs gate on it, but there is no per-port allowlist as defence in depth against a
-compromised laptop reaching, say, the desktop's database.
+- **A tracepoint-driven listener feed.** The server polls `/proc/net/tcp` every 250ms; an
+  `inet_sock_set_state` tracepoint would shrink the window in which a just-started server is not
+  yet reachable.
+
+- **A netlink monitor socket** for network-change detection. What is built compares an address and
+  route snapshot on each loop tick, which is enough because the tick is at most five seconds while
+  disconnected — but it is a poll.
+
+- **Suspend and resume, end to end.** The detector is unit tested; a VM cannot suspend.
+
+- **A bind/connect race** in a tight loop from two processes.
 
 **Smaller:**
 
 - A server that learns its peer outside the socket API — parsing `/proc/net/tcp`, or a sidecar
-  reading `ss` — sees `10.7.0.1`. Nothing in the wire path changes, by design.
-- `tests/lib/scenarios.nix` was never created. Now that `endtoend`, `control` and `hostile` all
-  drive the same two binaries, the duplication between them is real and extracting shared helpers
-  would pay for itself.
+  reading `ss` — sees the client's tunnel address. Nothing in the wire path changes, by design.
 - Only `--network=none` podman containers are covered.
 - Checksum correctness is asserted functionally, through hash-identical transfers, rather than by
   inspecting which `ip_summed` states were exercised.
-- The listener feed polls `/proc/net/tcp` every 250ms. An `inet_sock_set_state` tracepoint would
-  shrink the window in which a just-started desktop server is not yet reachable.

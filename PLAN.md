@@ -1,9 +1,15 @@
-# needlecast proof-of-concept plan
+# needlecast: the plan, and what became of it
 
-Reference for building the prototypes that validate the architecture settled in
-[initial_design_conversation.md](initial_design_conversation.md). Nothing here is production
-code — every item exists to answer a kernel-behaviour question that the design assumes but
-nobody has observed.
+The record of how this got built, kept as a plan rather than rewritten as a summary — the crossed-
+off items are the useful part.
+
+Phases 1 through 9 were proofs of concept: every item existed to answer a kernel-behaviour question
+the architecture in [initial_design_conversation.md](initial_design_conversation.md) assumed but
+nobody had observed. Phase 10 is the real build. All of them are done; what remains is listed at
+the end of Phase 10.
+
+What was measured rather than assumed is in [FINDINGS.md](FINDINGS.md); the requirements and
+decisions above the kernel are in [DESIGN.md](DESIGN.md).
 
 ## What the design already settled
 
@@ -117,7 +123,7 @@ Done. The toolchain turned out to be much simpler than planned — see
 - [x] Add `pkgs.bpf-linker` to the devshell.
 - [x] ~~Confirm `-Z build-std=core` works~~ — moot, `core` is prebuilt.
 - [x] Create the workspace layout:
-      - [x] `ebpf/` — `no_std`, its own workspace, target `bpfel-unknown-none`
+      - [x] `crates/ebpf/` — `no_std`, its own workspace, target `bpfel-unknown-none`
       - [x] `crates/common/` — `no_std`, map key and value types shared both ways
       - [x] `crates/poc/` — the loader plus a control CLI
       - [x] `nix/ebpf.nix` — derivation producing the `.o`
@@ -359,31 +365,56 @@ happy-path test noticing.
 
 **Not covered**
 
-- [ ] Desktop reboots mid-flow.
-- [ ] Laptop suspend and resume, and a network change that makes WireGuard roam.
+- [x] Desktop reboots mid-flow — covered by `tests/resilience.nix`, as a crash and a clean stop.
+- [x] A network change that makes WireGuard roam — `tests/resilience.nix` moves the peer's name to
+      a dead address and back, which is the only exercise of the re-resolution path.
+- [x] `tests/lib/scenarios.nix`, extracted once every product suite drove the same two commands.
+- [ ] Laptop suspend and resume, end to end. The detector is unit tested; the VM cannot suspend.
 - [ ] A bind/connect race in a tight loop from two processes.
-- [ ] `tests/lib/scenarios.nix`. Now that `endtoend`, `control` and `hostile` drive the same two
-      binaries, the duplication between them is real and worth extracting.
 
-## Phase 10: What is left between this and something installable
+## Phase 10: Everything above the kernel — done
 
-Every kernel question the design rested on is answered, and the system works end to end under a
-regression suite. What remains is the setup the POC harness has been doing on its behalf.
+The requirements and decisions live in [DESIGN.md](DESIGN.md). Every gap that document was written
+to close is now built and under test. Two commands, one shared secret, and a tunnel needlecast
+creates and owns:
 
-- **WireGuard interface management over netlink.** The tests create `wg0` declaratively; the daemon
-  should create and own it, and set `net.ipv4.conf.<iface>.route_localnet=1` on it. Keeping this
-  out of the POCs meant kernel failures were never confused with setup failures, which was the
-  right call — but it is now the largest gap.
-- **Pairing.** The one-time exchange of WireGuard public keys and endpoints. Hardcoded in the
-  tests.
-- **A real daemon rather than a POC CLI.** `needlecast-poc` has a subcommand per experiment and
-  writes readiness files for tests. The shape of the daemon is settled; the packaging is not.
-- **Enforcement of the desktop's port allowlist.** `Welcome` carries the managed range and the tc
-  programs gate on it, but there is no per-port allowlist as defence in depth against a compromised
-  laptop reaching, say, the desktop's database.
-- **IPv6 on the desktop datapath.** The tc programs count IPv6 packets and pass them through; there
-  is no `getpeername6` on the desktop either. The laptop side is complete.
+```
+needlecast server ./secret cesium.gio.ninja     # on the desktop
+needlecast client ./secret cadmium.gio.ninja    # on the laptop
+needlecast status
+```
+
+- [x] **The daemon owns its own WireGuard interface.** `crates/needlecast/src/transport.rs` over
+      `defguard_wireguard_rs`: create-or-replace `needle`, address it from `198.18.0.0/15`, set the
+      MTU, configure the peer with a `/32` allowed-ips, and remove it on a clean exit.
+      `net.ipv4.conf.needle.route_localnet=1` on the server only.
+- [x] **Endpoint re-resolution**, the `wg-quick` footgun: re-resolved on every reconnect attempt and
+      every five minutes while connected, updated only when the answer changed.
+- [x] **No pairing step.** Both keypairs are HKDF-SHA256 derived from one shared file, so neither
+      side has anything the other lacks. Cross-checked against `wg pubkey`.
+- [x] **A real daemon.** `server`, `client` and `status`; the experiment-per-subcommand surface is
+      gone. What the suites still need to isolate one half lives behind the `testing` crate feature
+      and cannot be expressed by the shipped binary.
+- [x] **`needlecast status`**, reading kernel and filesystem state with no IPC, so it works when the
+      daemon is wedged. Four states, each reached for real in `tests/status.nix`.
+- [x] **Adaptive heartbeat**, resume and network-change detection, and a server-side idle timeout.
+- [x] **A fatal, diagnosable version mismatch.** Eight raw bytes ahead of any postcard frame, so two
+      builds with incompatible schemas can still name each other's version. Exit 78, which the
+      module names in `RestartPreventExitStatus=`.
+- [x] **A NixOS module**, `nix/module.nix`, with the secret passed by `LoadCredential` and precise
+      firewall rules rather than a trusted interface.
+
+Deliberately not built:
+
+- **A per-port allowlist.** [DESIGN.md](DESIGN.md) decides against it: the managed range is the only
+  limit, and that is stated rather than hedged.
+- **IPv6 on the desktop datapath.** The tc programs count IPv6 and pass it through, and
+  `connect6` now *declines* rather than rewriting to the unspecified address when no v6 target is
+  configured. Room is reserved in `SleeveConfig`, in the tc counter indices, and in
+  `transport::Plan`, so adding it is new code rather than a layout change.
 - **A tracepoint-driven listener feed**, replacing the 250ms poll.
+- **A netlink monitor socket** for network-change detection; an address and route snapshot compared
+  on each loop tick is what is built.
 
 Deleted rather than deferred:
 
@@ -391,4 +422,5 @@ Deleted rather than deferred:
 - The `sock_ops` cookie-to-source-port handoff, the rendezvous socket, and sockmap splicing. All
   three belonged to architectures this design replaced.
 - Rung C, and both wire-level variants of Rung B. Measured, recorded in
-  [FINDINGS.md](FINDINGS.md), and removed.
+  [FINDINGS.md](FINDINGS.md), and removed — Rung A went with them once the product had only one
+  mode.

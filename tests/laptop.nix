@@ -1,15 +1,15 @@
 {
   pkgs,
   testers,
-  needlecast-poc,
+  needlecast,
   kernelPackages,
   variant,
 }: let
-  nodes = import ./lib/nodes.nix {inherit pkgs needlecast-poc kernelPackages;};
+  nodes = import ./lib/nodes.nix {inherit pkgs needlecast kernelPackages;};
   probe = import ./lib/probe.nix {inherit pkgs;};
 in
   testers.runNixOSTest {
-    name = "needlecast-phase2-${variant}";
+    name = "needlecast-laptop-${variant}";
 
     nodes.laptop = {...}: {
       imports = [nodes.laptop];
@@ -37,24 +37,24 @@ in
       laptop.succeed("ip link set nc-desktop up")
 
       def start_loader(extra=""):
-          laptop.succeed("rm -f /run/needlecast-poc.ready")
+          laptop.succeed("rm -f /run/needlecast/client.ready")
           laptop.succeed(
               "systemd-run --unit=needlecast --collect "
-              f"needlecast-poc run --port-lo 8000 --port-hi 8999 "
+              f"needlecast harness bridge --port-lo 8000 --port-hi 8999 "
               f"--target-v4 {TARGET4} --target-v6 {TARGET6} {extra}"
           )
           try:
-              laptop.wait_until_succeeds("test -e /run/needlecast-poc.ready", timeout=30)
+              laptop.wait_until_succeeds("test -e /run/needlecast/client.ready", timeout=30)
           except Exception:
               print(laptop.succeed("journalctl -u needlecast.service --no-pager || true"))
               raise
 
       def stop_loader():
           laptop.succeed("systemctl stop needlecast.service || true")
-          laptop.succeed("rm -rf /sys/fs/bpf/needlecast /run/needlecast-poc.ready || true")
+          laptop.succeed("rm -rf /sys/fs/bpf/needlecast/client /run/needlecast/client.ready || true")
 
       def counters():
-          out = laptop.succeed("needlecast-poc counters || true")
+          out = laptop.succeed("needlecast dev counters || true")
           d = {}
           for line in out.strip().splitlines():
               if "=" in line:
@@ -93,7 +93,7 @@ in
           )
 
       with subtest("the embedded object is aligned, and misalignment is what would break it"):
-          out = laptop.succeed("needlecast-poc alignment-check")
+          out = laptop.succeed("needlecast dev alignment-check")
           print(out)
           a = dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
           assert a["align_32_offset"] == "0", a
@@ -101,19 +101,23 @@ in
           assert a["misaligned_parse"] == "failed", a
 
       with subtest("the embedded object parses"):
-          print(laptop.succeed("needlecast-poc verify-object"))
+          print(laptop.succeed("needlecast dev verify-object"))
           print(laptop.succeed("mount | grep bpf || true"))
           laptop.succeed("test -e /sys/kernel/btf/vmlinux")
 
       with subtest("smoke: all nine programs load and attach"):
-          laptop.succeed("needlecast-poc probe-syncnt > /tmp/syncnt-result; echo rc=$? >> /tmp/syncnt-result")
+          laptop.succeed("needlecast dev probe-syncnt > /tmp/syncnt-result; echo rc=$? >> /tmp/syncnt-result")
           print("probe-syncnt: " + laptop.succeed("cat /tmp/syncnt-result"))
           start_loader("--syncnt-probe")
-          ready = laptop.succeed("cat /run/needlecast-poc.ready")
-          print("attached: " + ready)
+          ready = laptop.succeed("cat /run/needlecast/client.ready")
+          print("ready file:\n" + ready)
+          attached = dict(
+              l.split("=", 1) for l in ready.strip().splitlines() if "=" in l
+          )["attached"].split(",")
           for want in ["connect4", "connect6", "getpeername4", "getpeername6",
-                       "sendmsg4", "sendmsg6", "recvmsg4", "recvmsg6"]:
-              assert want in ready.split(), f"{want} not attached: {ready}"
+                       "sendmsg4", "sendmsg6", "recvmsg4", "recvmsg6",
+                       "connect4_syncnt_probe"]:
+              assert want in attached, f"{want} not attached: {attached}"
           print(laptop.succeed("bpftool cgroup tree /sys/fs/cgroup || true"))
           print(laptop.succeed("bpftool link list || true"))
 
@@ -192,12 +196,12 @@ in
           assert delta(before, "connect4.wrong_netns") == 1, counters()
 
       with subtest("clearing the enabled flag restores stock behaviour"):
-          laptop.succeed("needlecast-poc set-enabled 0")
+          laptop.succeed("needlecast dev set-enabled 0")
           before = counters()
           r = connect("127.0.0.1", PORT)
           assert r.get("error") == "ECONNREFUSED", r
           assert delta(before, "connect4.disabled") == 1, counters()
-          laptop.succeed("needlecast-poc set-enabled 1")
+          laptop.succeed("needlecast dev set-enabled 1")
           r = connect("127.0.0.1", PORT)
           assert r.get("data") == "desktop", r
 
@@ -208,7 +212,7 @@ in
           r = connect("127.0.0.1", PORT)
           assert r.get("error") == "ECONNREFUSED", r
           assert delta(before, "connect4.not_advertised") == 1, counters()
-          laptop.succeed(f"needlecast-poc advertise {PORT}")
+          laptop.succeed(f"needlecast dev advertise {PORT}")
           r = connect("127.0.0.1", PORT)
           assert r.get("data") == "desktop", r
           stop_loader()
@@ -229,6 +233,11 @@ in
           r = connect("::ffff:127.0.0.1", PORT, "--v6")
           assert r.get("data") == "desktop", r
           assert delta(before, "connect6.rewritten") == 1, counters()
+          # A dual-stack program asking for `localhost` arrives here rather than in connect4, so
+          # leaving the SYN cap off this path would give exactly those programs the stock
+          # two-minute hang when the server vanishes.
+          assert delta(before, "connect6.setsockopt_ok") == 1, counters()
+          assert delta(before, "connect6.setsockopt_err") == 0, counters()
 
       with subtest("question 6: UDP unconnected sockets go through sendmsg4"):
           serve("udp-desktop", TARGET4, PORT, "udp-desktop", "--udp")
@@ -237,6 +246,10 @@ in
           r = connect("127.0.0.1", PORT, "--udp --unconnected")
           assert r.get("data", "").startswith("udp-desktop"), r
           assert delta(before, "sendmsg4.rewritten") == 1, counters()
+          # TCP_SYNCNT is meaningless on a UDP socket, so it is not attempted rather than attempted
+          # and failed — otherwise every datagram would bury the real setsockopt_err signal.
+          assert delta(before, "sendmsg4.setsockopt_ok") == 0, counters()
+          assert delta(before, "sendmsg4.setsockopt_err") == 0, counters()
 
       with subtest("recvmsg4 restores the source address on UDP replies"):
           before = counters()
@@ -315,7 +328,7 @@ in
 
       with subtest("final counter snapshot"):
           print("--- counters ---")
-          print(laptop.succeed("needlecast-poc counters"))
+          print(laptop.succeed("needlecast dev counters"))
           print("--- syncnt ---")
           print(laptop.succeed("cat /tmp/syncnt-result"))
 

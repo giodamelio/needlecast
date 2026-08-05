@@ -7,6 +7,10 @@ edition = "2021"
 default = []
 user = ["dep:aya", "dep:serde", "dep:postcard"]
 
+[dev-dependencies]
+# So `cargo test -p needlecast-common` covers `proto`, which is behind the `user` feature.
+needlecast-common = { path = ".", features = ["user"] }
+
 [dependencies]
 aya = { version = "0.13", optional = true }
 serde = { version = "1", features = ["derive", "alloc"], default-features = false, optional = true }

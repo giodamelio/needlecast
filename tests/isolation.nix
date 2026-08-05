@@ -1,11 +1,11 @@
 {
   pkgs,
   testers,
-  needlecast-poc,
+  needlecast,
   kernelPackages,
   variant,
 }: let
-  nodes = import ./lib/nodes.nix {inherit pkgs needlecast-poc kernelPackages;};
+  nodes = import ./lib/nodes.nix {inherit pkgs needlecast kernelPackages;};
   probe = import ./lib/probe.nix {inherit pkgs;};
 
   # Built locally so the test never needs a registry. The runtime closure of the probe pulls in
@@ -44,24 +44,24 @@ in
       laptop.succeed("ip link set nc-desktop up")
 
       def start_loader(extra=""):
-          laptop.succeed("rm -f /run/needlecast-poc.ready")
+          laptop.succeed("rm -f /run/needlecast/client.ready")
           laptop.succeed(
               "systemd-run --unit=needlecast --collect "
-              f"needlecast-poc run --port-lo 8000 --port-hi 8999 "
+              f"needlecast harness bridge --port-lo 8000 --port-hi 8999 "
               f"--target-v4 {TARGET4} --target-v6 {TARGET6} {extra}"
           )
           try:
-              laptop.wait_until_succeeds("test -e /run/needlecast-poc.ready", timeout=30)
+              laptop.wait_until_succeeds("test -e /run/needlecast/client.ready", timeout=30)
           except Exception:
               print(laptop.succeed("journalctl -u needlecast.service --no-pager || true"))
               raise
 
       def stop_loader():
           laptop.succeed("systemctl stop needlecast.service || true")
-          laptop.succeed("rm -rf /sys/fs/bpf/needlecast /run/needlecast-poc.ready || true")
+          laptop.succeed("rm -rf /sys/fs/bpf/needlecast/client /run/needlecast/client.ready || true")
 
       def counters():
-          out = laptop.succeed("needlecast-poc counters || true")
+          out = laptop.succeed("needlecast dev counters || true")
           d = {}
           for line in out.strip().splitlines():
               if "=" in line:
@@ -101,7 +101,7 @@ in
           ))
 
       with subtest("the embedded object is aligned, and misalignment is what would break it"):
-          out = laptop.succeed("needlecast-poc alignment-check")
+          out = laptop.succeed("needlecast dev alignment-check")
           print(out)
           a = dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
           assert a["align_32_offset"] == "0", a

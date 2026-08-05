@@ -13,9 +13,9 @@ stdenv.mkDerivation {
   src = import ./source.nix {inherit lib;};
 
   cargoDeps = rustPlatform.importCargoLock {
-    lockFile = ../ebpf/Cargo.lock;
+    lockFile = ../crates/ebpf/Cargo.lock;
   };
-  cargoRoot = "ebpf";
+  cargoRoot = "crates/ebpf";
 
   nativeBuildInputs = [
     rustPlatform.cargoSetupHook
@@ -26,19 +26,20 @@ stdenv.mkDerivation {
 
   # nixpkgs rustc is stable and already ships a prebuilt core for bpfel-unknown-none, so the only
   # thing missing is aya-ebpf's one nightly feature.
-  # The target and rustflags come from ebpf/.cargo/config.toml, which cargoSetupHook preserves.
+  # The target and rustflags come from crates/ebpf/.cargo/config.toml, which cargoSetupHook
+  # preserves.
   RUSTC_BOOTSTRAP = "1";
 
   buildPhase = ''
     runHook preBuild
-    (cd ebpf && cargo build --release --offline --target bpfel-unknown-none)
+    (cd crates/ebpf && cargo build --release --offline --target bpfel-unknown-none)
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
     mkdir -p $out/lib
-    cp ebpf/target/bpfel-unknown-none/release/needlecast $out/lib/needlecast.o
+    cp crates/ebpf/target/bpfel-unknown-none/release/needlecast $out/lib/needlecast.o
     runHook postInstall
   '';
 

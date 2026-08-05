@@ -1,6 +1,8 @@
 {
   pkgs,
-  needlecast-poc,
+  needlecast,
+  needlecast-testing,
+  module,
 }: let
   inherit (pkgs.lib) concatMapAttrs;
 
@@ -15,28 +17,60 @@
   perKernel = f:
     concatMapAttrs (variant: kernelPackages: f variant kernelPackages) kernels;
 
-  # Suites that need only one machine, plus the end-to-end one that needs two but is not
-  # parameterised by transport — it only makes sense over the real tunnel.
-  simpleSuites = {
-    phase2 = ./phase2.nix;
-    isolation = ./isolation.nix;
+  # Suites that drive the shipped binary — the product surface, secret file and all. Nothing
+  # feature-gated can be load bearing for anything proved here.
+  productSuites = {
+    transport = ./transport.nix;
     endtoend = ./endtoend.nix;
     control = ./control.nix;
     hostile = ./hostile.nix;
+    status = ./status.nix;
+    resilience = ./resilience.nix;
+  };
+
+  # Suites that isolate one half of the system, which the shipped binary deliberately cannot do.
+  harnessSuites = {
+    laptop = ./laptop.nix;
+    isolation = ./isolation.nix;
   };
 in
   concatMapAttrs (suite: path:
     perKernel (variant: kernelPackages: {
       "${suite}-${variant}" =
-        pkgs.callPackage path {inherit needlecast-poc kernelPackages variant;};
+        pkgs.callPackage path {inherit needlecast kernelPackages variant;};
     }))
-  simpleSuites
-  # The desktop datapath runs the same assertions over plain ethernet and over WireGuard, so
-  # Phase 4 is Phase 3 with one variable changed rather than a second test.
+  productSuites
+  # The module suite builds its nodes from the module rather than from `systemd-run`, which is the
+  # only thing that proves the module and the daemon's flags agree.
+  // perKernel (variant: kernelPackages: {
+    "module-${variant}" =
+      pkgs.callPackage ./module.nix {inherit needlecast kernelPackages variant module;};
+  })
+  # The demo is the thing you boot, not a regression net: it duplicates what `module` already
+  # asserts, so it runs on the target kernel only.
+  // {
+    demo = pkgs.callPackage ./demo.nix {
+      inherit needlecast module;
+      kernelPackages = kernels."6_18";
+      variant = "6_18";
+    };
+  }
+  // concatMapAttrs (suite: path:
+    perKernel (variant: kernelPackages: {
+      "${suite}-${variant}" = pkgs.callPackage path {
+        needlecast = needlecast-testing;
+        inherit kernelPackages variant;
+      };
+    }))
+  harnessSuites
+  # The datapath runs the same assertions over plain ethernet and over WireGuard, so the transport
+  # is one variable changed rather than a second test. Both use the testing build: the ethernet
+  # variant is the only coverage of the ARPHRD_ETHER L3 offset, which the product never sees.
   // concatMapAttrs (transport: _:
     perKernel (variant: kernelPackages: {
-      "desktop-${transport}-${variant}" = pkgs.callPackage ./desktop.nix {
-        inherit needlecast-poc kernelPackages variant transport;
+      "datapath-${transport}-${variant}" = pkgs.callPackage ./datapath.nix {
+        needlecast = needlecast-testing;
+        inherit kernelPackages variant transport;
       };
     })) {
     ethernet = null;

@@ -1,6 +1,6 @@
 {
   pkgs,
-  needlecast-poc,
+  needlecast,
   kernelPackages,
 }: {
   # Shared machine definition so sysctls and tooling are declared once and every test observes the
@@ -10,7 +10,7 @@
     boot.kernelPackages = kernelPackages;
 
     environment.systemPackages = with pkgs; [
-      needlecast-poc
+      needlecast
       bpftools
       curl
       iproute2

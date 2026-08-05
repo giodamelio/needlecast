@@ -1,7 +1,7 @@
 {
   pkgs,
   testers,
-  needlecast-poc,
+  needlecast,
   kernelPackages,
   variant,
   transport,
@@ -18,7 +18,7 @@
     virtualisation.cores = 2;
     virtualisation.diskSize = 4096;
     environment.systemPackages = with pkgs; [
-      needlecast-poc
+      needlecast
       probe
       bpftools
       iproute2
@@ -29,7 +29,7 @@
   };
 in
   testers.runNixOSTest {
-    name = "needlecast-desktop-${transport}-${variant}";
+    name = "needlecast-datapath-${transport}-${variant}";
 
     nodes.laptop = {...}: {imports = [common t.laptop];};
     nodes.desktop = {...}: {imports = [common t.desktop];};
@@ -74,32 +74,30 @@ in
           return d
 
       def tc_counters():
-          out = desktop.succeed("needlecast-poc tc-counters || true")
+          out = desktop.succeed("needlecast dev tc-counters || true")
           return {k: int(v) for k, v in parse(out).items()}
 
       def tc_delta(before, key):
           return tc_counters().get(key, 0) - before.get(key, 0)
 
-      def start_sleeve(mode="rung-a"):  # explicit everywhere; the CLI default is not exercised
-          desktop.succeed("rm -f /run/needlecast-sleeve.ready")
+      def start_datapath():
+          desktop.succeed("rm -f /run/needlecast/server.ready")
           desktop.succeed(
-              # The POC shells out to `ip` for the peer route; systemd-run's PATH does not include
-              # iproute2. The real daemon manages the route over netlink alongside the interface.
-              "systemd-run --unit=sleeve --collect --setenv=PATH=$PATH "
-              f"needlecast-poc sleeve --iface {IFACE} --transport-v4 {DESKTOP} "
-              f"--transport-peer-v4 {LAPTOP} --mode {mode} "
+              "systemd-run --unit=ncdatapath --collect "
+              f"needlecast harness datapath --iface {IFACE} --transport-v4 {DESKTOP} "
+              f"--transport-peer-v4 {LAPTOP} "
               "--port-lo 8000 --port-hi 8999"
           )
           try:
-              desktop.wait_until_succeeds("test -e /run/needlecast-sleeve.ready", timeout=30)
+              desktop.wait_until_succeeds("test -e /run/needlecast/server.ready", timeout=30)
           except Exception:
-              print(desktop.succeed("journalctl -u sleeve.service --no-pager || true"))
+              print(desktop.succeed("journalctl -u ncdatapath.service --no-pager || true"))
               raise
 
-      def stop_sleeve():
-          desktop.succeed("systemctl stop sleeve.service || true")
+      def stop_datapath():
+          desktop.succeed("systemctl stop ncdatapath.service || true")
           desktop.succeed(f"tc qdisc del dev {IFACE} clsact 2>/dev/null || true")
-          desktop.succeed("rm -rf /sys/fs/bpf/needlecast-sleeve /run/needlecast-sleeve.ready")
+          desktop.succeed("rm -rf /sys/fs/bpf/needlecast/server /run/needlecast/server.ready")
 
       def serve(name, bind, port, token, extra=""):
           desktop.succeed(
@@ -116,7 +114,7 @@ in
       def sysctl(m, key, value):
           m.succeed(f"sysctl -qw {key}={value}")
 
-      with subtest("baseline: without the sleeve, a loopback-bound server is unreachable"):
+      with subtest("baseline: without the datapath, a loopback-bound server is unreachable"):
           serve("dev", "127.0.0.1", PORT, "desktop")
           desktop.wait_until_succeeds(f"ss -lnt | grep -q '127.0.0.1:{PORT}'", timeout=30)
           r = connect(PORT)
@@ -125,7 +123,7 @@ in
 
       with subtest("question 1: the tc datapath delivers into a 127.0.0.1-bound server"):
           sysctl(desktop, f"net.ipv4.conf.{IFACE}.route_localnet", 1)
-          start_sleeve()
+          start_datapath()
           before = tc_counters()
           r = connect(PORT)
           assert r.get("data") == "desktop", r
@@ -146,7 +144,8 @@ in
           established = desktop.succeed("ss -tn state established | grep ':8081'")
           print(established)
           assert "127.0.0.1:8081" in established, established
-          # Rung A leaves the source alone, so the peer is the laptop's transport address.
+          # The wire is never rewritten on the source side inbound, so the kernel's peer is the
+          # client's transport address. What the *application* is told is covered separately.
           assert LAPTOP in established, established
 
       # The server's socket is on loopback, whose MTU is 65536, but the segments have to fit the
@@ -245,15 +244,16 @@ in
               assert desktop.succeed(f"sysctl -n {key}").strip() == "0", key
           assert connect(PORT).get("data") == "desktop"
 
-      with subtest("clearing the sleeve restores stock behaviour"):
-          stop_sleeve()
+      with subtest("clearing the datapath restores stock behaviour"):
+          stop_datapath()
           r = connect(PORT)
           assert r.get("error") in ("ECONNREFUSED", "TIMEOUT"), r
+          start_datapath()
 
       # The requirement is that the dev server cannot tell a forwarded connection from a local one.
       # Measured as what the server *application* is told, since that is what the requirement is
       # about — `ss` reads the kernel socket table and is shown only for contrast.
-      with subtest("rung B: the server cannot distinguish a forwarded connection"):
+      with subtest("the server cannot distinguish a forwarded connection from a local one"):
 
           def app_peer(unit, port):
               desktop.wait_until_succeeds(
@@ -275,28 +275,23 @@ in
               )
               return parse(laptop.succeed(f"cat /tmp/inv{port}.out"))
 
-          results = {}
-          for label, m, port in [("rung-a", "rung-a", 8084), ("rung-b", "rung-b", 8085)]:
-              stop_sleeve()
-              start_sleeve(m)
-              serve(f"inv{port}", "127.0.0.1", port, "invisible", "--hold 120")
-              desktop.wait_until_succeeds(f"ss -lnt | grep -q '127.0.0.1:{port}'", timeout=30)
-              r = remote_connect(port)
-              assert "data" in r, (label, r)
-              kernel_view = desktop.succeed(
-                  f"ss -tn state established | grep '127.0.0.1:{port} '"
-              ).strip().split()[-1].rsplit(":", 1)[0]
-              results[label] = (app_peer(f"inv{port}", port), kernel_view)
+          serve("inv8085", "127.0.0.1", 8085, "invisible", "--hold 120")
+          desktop.wait_until_succeeds("ss -lnt | grep -q '127.0.0.1:8085'", timeout=30)
+          r = remote_connect(8085)
+          assert "data" in r, r
+          kernel_view = desktop.succeed(
+              "ss -tn state established | grep '127.0.0.1:8085 '"
+          ).strip().split()[-1].rsplit(":", 1)[0]
+          forwarded = app_peer("inv8085", 8085)
+          print(f"server sees={forwarded}  ss shows={kernel_view}")
 
-          for k, (app, kern) in results.items():
-              print(f"rung B [{k}]: server sees={app}  ss shows={kern}")
+          assert forwarded == "127.0.0.1", forwarded
+          # `ss` still shows the truth, which is a feature: the operator debugging the machine
+          # sees the real tunnel address while the application sees loopback.
+          assert kernel_view == LAPTOP, kernel_view
 
-          assert results["rung-a"][0] == LAPTOP, results
-          assert results["rung-b"][0] == "127.0.0.1", results
-          assert results["rung-b"][1] == LAPTOP, "the kernel view should still be the truth"
-
-          # The point of the whole exercise: byte-identical to a connection made on the desktop
-          # itself, so no comparison a server can make will separate them.
+          # The point of the whole exercise: byte-identical to a connection made on the server
+          # itself, so no comparison a server can make through the socket API separates them.
           serve("localsrv", "127.0.0.1", 8087, "invisible", "--hold 120")
           desktop.wait_until_succeeds("ss -lnt | grep -q '127.0.0.1:8087'", timeout=30)
           desktop.succeed(
@@ -305,12 +300,12 @@ in
           )
           genuinely_local = app_peer("localsrv", 8087)
           print(f"a genuinely local connection reports: {genuinely_local}")
-          assert results["rung-b"][0] == genuinely_local, (results, genuinely_local)
+          assert forwarded == genuinely_local, (forwarded, genuinely_local)
 
       # Nothing outside the interface needlecast creates: no route, no attachment to lo, and no
       # sysctl anywhere else.
-      with subtest("rung B touches nothing on the machine"):
-          ready = desktop.succeed("cat /run/needlecast-sleeve.ready")
+      with subtest("the datapath touches nothing else on the machine"):
+          ready = desktop.succeed("cat /run/needlecast/server.ready")
           print(ready)
           assert "sleeve_getpeername4" in ready, ready
           assert "clsact" not in desktop.succeed("tc qdisc show dev lo")
@@ -322,7 +317,7 @@ in
                       "net.ipv4.conf.default.route_localnet"):
               assert desktop.succeed(f"sysctl -n {key}").strip() == "0", key
 
-      with subtest("rung B carries bulk and UDP"):
+      with subtest("bulk and UDP survive"):
           r = parse(laptop.succeed(
               f"nc-probe connect --host {DESKTOP} --port 8082 --out /tmp/blob2 --timeout 300"
           ))
@@ -333,13 +328,9 @@ in
           r = connect(8083, f"--udp --unconnected --payload-size {MTU * 4} --timeout 30")
           assert r.get("echo_ok") == "True", r
 
-      with subtest("restore rung A for the final snapshot"):
-          stop_sleeve()
-          start_sleeve("rung-a")
-
       with subtest("final tc counter snapshot"):
           connect(PORT)
-          print(desktop.succeed("needlecast-poc tc-counters"))
+          print(desktop.succeed("needlecast dev tc-counters"))
           print(desktop.succeed("cat /tmp/sysctl-findings"))
     '';
   }

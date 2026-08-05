@@ -1,0 +1,29 @@
+# The `vm` test binary shells out to `nix build` and boots virtual machines, so it is excluded from
+# the default profile rather than merely being slow to run alongside the unit tests.
+[profile.default]
+default-filter = "not binary(vm)"
+failure-output = "immediate-final"
+fail-fast = false
+
+# The NixOS suites. Each boots one or two machines with 2GB of RAM, so run a couple at a time
+# rather than one per core, and expect minutes rather than the default slow-test cadence.
+[profile.vm]
+default-filter = "binary(vm)"
+test-threads = 2
+failure-output = "immediate-final"
+fail-fast = false
+
+[[profile.vm.overrides]]
+filter = "binary(vm)"
+slow-timeout = { period = "120s", terminate-after = 30 }
+
+# Everything, for a pre-push gate.
+[profile.all]
+default-filter = "all()"
+test-threads = 2
+failure-output = "immediate-final"
+fail-fast = false
+
+[[profile.all.overrides]]
+filter = "binary(vm)"
+slow-timeout = { period = "120s", terminate-after = 30 }
