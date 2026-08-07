@@ -1,5 +1,4 @@
-// `no_std` for the BPF target, but the test harness needs std to run, and the predicates in `net`
-// are the part of this crate most worth testing.
+// The test harness needs std, and `net` is the part of this crate most worth testing.
 #![cfg_attr(not(test), no_std)]
 
 #[cfg(all(feature = "user", not(test)))]
@@ -10,13 +9,13 @@ pub mod net;
 #[cfg(feature = "user")]
 pub mod proto;
 
-/// Shared with BPF, so the layout must stay stable and `Pod`-safe.
+/// Shared with BPF: the layout must stay stable and `Pod`-safe.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Config {
-    /// Host netns cookie captured at load time. `connect4` bails when it does not match.
+    /// Captured at load time; the decision programs bail when it does not match.
     pub netns_cookie: u64,
-    /// Where to send a connection that has no local listener, network byte order.
+    /// Network byte order, as everything the programs compare against is.
     pub target_v4: u32,
     pub target_v6: [u32; 4],
     pub port_lo: u16,
@@ -24,7 +23,7 @@ pub struct Config {
     pub enabled: u8,
     /// Consult `DESKTOP_PORTS` before rewriting.
     pub use_listener_map: u8,
-    /// `TCP_SYNCNT` to set on rewritten sockets. Zero leaves it alone.
+    /// Zero leaves the system default.
     pub syncnt: u8,
     pub _pad: u8,
 }
@@ -60,8 +59,7 @@ pub mod ev {
     pub const SETSOCKOPT_OK: u32 = 10;
     pub const SETSOCKOPT_ERR: u32 = 11;
     pub const NETNS_COOKIE_UNAVAILABLE: u32 = 12;
-    /// The destination is IPv6 but no IPv6 tunnel address is configured, so there is nowhere to
-    /// send it. Rewriting to the unspecified address would be worse than declining.
+    /// IPv6 destination with no IPv6 tunnel address, so there is nowhere to send it.
     pub const NO_V6_TARGET: u32 = 13;
     pub const COUNT: u32 = 16;
 }
@@ -106,21 +104,18 @@ pub const PROG_NAMES: [&str; prog::COUNT as usize] = [
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SleeveConfig {
-    /// This machine's address on the transport link, network byte order.
     pub transport_v4: u32,
-    /// The laptop's address on the transport link, network byte order.
     pub transport_peer_v4: u32,
-    /// Where inbound packets are delivered, and what the peer is reported as. `127.0.0.1`.
+    /// Where inbound packets are delivered, and what the peer is reported as.
     pub local_v4: u32,
-    /// The v6 counterparts. Unused while the desktop datapath is IPv4-only; declared now so adding
-    /// v6 is new code rather than a layout change to a struct BPF and userspace both depend on.
+    /// Unused while the server datapath is IPv4-only, so adding v6 is new code rather than a layout
+    /// change to a struct BPF and userspace both depend on.
     pub transport_v6: [u32; 4],
     pub transport_peer_v6: [u32; 4],
     pub local_v6: [u32; 4],
     pub port_lo: u16,
     pub port_hi: u16,
-    /// Offset of the IP header within the skb: 14 on an Ethernet-framed device, 0 on an L3-only
-    /// one such as a WireGuard interface.
+    /// 14 on an Ethernet-framed device, 0 on an L3-only one.
     pub l3_offset: u16,
     pub enabled: u8,
     pub _pad: u8,
@@ -133,8 +128,8 @@ pub mod tc {
     pub const INGRESS: u32 = 0;
     pub const EGRESS: u32 = 1;
     pub const GETPEERNAME: u32 = 2;
-    /// Reserved. Counters are indexed `prog * tcev::COUNT + ev`, so leaving room for the v6
-    /// program now costs one unused row and saves reindexing every existing counter later.
+    /// Reserved: counters are indexed `prog * tcev::COUNT + ev`, so adding a program later would
+    /// reindex every existing one.
     pub const GETPEERNAME6: u32 = 3;
     pub const COUNT: u32 = 4;
 }

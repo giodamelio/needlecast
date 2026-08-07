@@ -1,8 +1,7 @@
 //! Loading, attaching, and reaching the pinned maps.
 //!
-//! Both halves of needlecast load the same object and keep their programs alive by holding the
-//! `bpf_link`s. Dropping them — or dying — detaches everything, which is what makes a crashed
-//! daemon revert the machine to stock rather than leave it half-configured.
+//! Both halves keep their programs alive by holding the `bpf_link`s, so a crashed daemon reverts
+//! the machine to stock rather than leaving it half-configured.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -14,30 +13,24 @@ use aya::programs::{CgroupAttachMode, CgroupSockAddr, SchedClassifier};
 use aya::{Ebpf, EbpfLoader};
 use needlecast_common::{Config, CONFIG_KEY};
 
-/// Plain `include_bytes!` yields alignment 1, but the `object` crate parses the ELF header
-/// zero-copy and needs it aligned. Whether that happens to work depends on where the linker put
-/// the array, so it fails intermittently across rebuilds.
+/// `include_bytes!` yields alignment 1, but `object` parses the ELF header zero-copy and needs it
+/// aligned — so it fails depending on where the linker happened to put the array.
 pub const OBJECT: &[u8] = aya::include_bytes_aligned!(env!("NEEDLECAST_EBPF_OBJ"));
 
-/// What `include_bytes_aligned!` guarantees.
 pub const OBJECT_ALIGN: usize = 32;
 
 pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 pub const RUN_DIR: &str = "/run/needlecast";
 
-/// The laptop half: `cgroup_sock_addr` programs and the maps they decide from.
 pub const CLIENT_PIN_DIR: &str = "/sys/fs/bpf/needlecast/client";
 pub const CLIENT_READY_FILE: &str = "/run/needlecast/client.ready";
 
-/// The desktop half: the tc datapath and its own config.
 pub const SERVER_PIN_DIR: &str = "/sys/fs/bpf/needlecast/server";
 pub const SERVER_READY_FILE: &str = "/run/needlecast/server.ready";
 
-/// What the server attaches. Named here so `status` can ask whether they are still loaded, which
-/// is the only honest liveness signal: they disappear with the process holding their links.
+/// Named so `status` can ask whether they are still loaded — the only honest liveness signal.
 pub const SERVER_PROGRAMS: &[&str] = &["tc_ingress", "tc_egress", "sleeve_getpeername4"];
 
-/// Attached to the cgroup on the client, in this order.
 pub const CLIENT_PROGRAMS: &[&str] = &[
     "connect4",
     "connect6",
@@ -49,9 +42,8 @@ pub const CLIENT_PROGRAMS: &[&str] = &[
     "recvmsg6",
 ];
 
-/// Alignment of the embedded object is guaranteed by `include_bytes_aligned!`, but the failure it
-/// prevents is intermittent and its error message points nowhere useful, so check it explicitly
-/// rather than letting a regression come back as a confusing ELF parse error on one build in three.
+/// Checked explicitly because the failure it prevents is intermittent and its error message points
+/// nowhere useful.
 pub fn assert_object_aligned() -> Result<()> {
     let offset = OBJECT.as_ptr() as usize % OBJECT_ALIGN;
     if offset != 0 {
@@ -64,8 +56,8 @@ pub fn assert_object_aligned() -> Result<()> {
     Ok(())
 }
 
-/// `EbpfError`'s inner `object::read::Error` is not exposed as a `source`, so the Display chain
-/// stops at "error parsing ELF data". Debug is the only way to see what actually went wrong.
+/// `EbpfError`'s inner `object::read::Error` is not a `source`, so Display stops at "error parsing
+/// ELF data" and `{:?}` is the only way to see the cause.
 pub fn load_object(pin_dir: &str) -> Result<Ebpf> {
     assert_object_aligned()?;
     EbpfLoader::new()
@@ -74,7 +66,7 @@ pub fn load_object(pin_dir: &str) -> Result<Ebpf> {
         .map_err(|e| anyhow!("loading BPF object: {e:?}"))
 }
 
-/// Stale pins from a previous run would silently carry old counters and config forward.
+/// Stale pins would silently carry old counters and config forward.
 pub fn reset_pin_dir(dir: &str) -> Result<()> {
     if Path::new(dir).exists() {
         std::fs::remove_dir_all(dir)
@@ -84,8 +76,8 @@ pub fn reset_pin_dir(dir: &str) -> Result<()> {
     Ok(())
 }
 
-/// Written only after every attach and config write succeeded, so tests and `status` can wait on
-/// real readiness instead of on the map pins, which appear during load and survive a crash.
+/// Written only once every attach succeeded, so waiting on it means waiting on real readiness —
+/// unlike the map pins, which appear during load and survive a crash.
 pub fn write_ready(path: &str, contents: &str) -> Result<()> {
     std::fs::create_dir_all(RUN_DIR).with_context(|| format!("creating {RUN_DIR}"))?;
     std::fs::write(path, contents).with_context(|| format!("writing {path}"))
@@ -102,7 +94,7 @@ pub fn attach_cgroup(ebpf: &mut Ebpf, name: &str, cgroup: &std::fs::File) -> Res
         .try_into()?;
     program.load()?;
     // `AllowMultiple` maps to BPF_F_ALLOW_MULTI, which `bpf_link_create` rejects with EINVAL.
-    // `Single` maps to flags 0 and, despite the name, does not restrict us to one program.
+    // `Single` is flags 0 and, despite the name, does not restrict us to one program.
     program.attach(cgroup, CgroupAttachMode::Single)?;
     Ok(())
 }
@@ -126,9 +118,8 @@ pub fn attach_tc(
     Ok(())
 }
 
-/// 1 is `ARPHRD_ETHER`, so the IP header sits after a 14-byte link header. A WireGuard interface
-/// reports `ARPHRD_NONE` and has no link header at all. Reading it beats guessing, and it is the
-/// single value that lets one program serve both device classes.
+/// `ARPHRD_ETHER` puts the IP header 14 bytes in; a WireGuard interface is `ARPHRD_NONE` and has
+/// no link header at all. This one value is what lets a single program serve both device classes.
 pub fn l3_offset_for(iface: &str) -> Result<u16> {
     let path = format!("/sys/class/net/{iface}/type");
     let raw = std::fs::read_to_string(&path).with_context(|| format!("reading {path}"))?;
@@ -141,8 +132,8 @@ pub fn l3_offset_for(iface: &str) -> Result<u16> {
     })
 }
 
-/// `SO_NETNS_COOKIE` on any socket returns the cookie of the namespace it was created in, which is
-/// what `bpf_get_netns_cookie` reports from inside the program.
+/// Returns the same value `bpf_get_netns_cookie` reports from inside a program, which is what
+/// makes the container guard implementable.
 pub fn netns_cookie() -> Result<u64> {
     const SO_NETNS_COOKIE: libc::c_int = 71;
     unsafe {
@@ -172,7 +163,7 @@ pub fn v4_be(addr: Ipv4Addr) -> u32 {
     u32::from(addr).to_be()
 }
 
-/// Four network-byte-order words, matching `bpf_sock_addr::user_ip6`.
+/// Matching `bpf_sock_addr::user_ip6`.
 pub fn v6_words(addr: std::net::Ipv6Addr) -> [u32; 4] {
     let o = addr.octets();
     let mut w = [0u32; 4];
@@ -220,8 +211,7 @@ fn update_config(f: impl FnOnce(&mut Config)) -> Result<()> {
     Ok(())
 }
 
-/// Replaces the whole set rather than applying a delta, so a dropped update cannot leave the two
-/// sides disagreeing indefinitely.
+/// Whole set rather than a delta, so a dropped update cannot leave the two sides disagreeing.
 pub fn replace_listeners(ports: &[u16]) -> Result<()> {
     let mut m = open_pinned(CLIENT_PIN_DIR, "DESKTOP_PORTS", Map::HashMap)?;
     let mut map: HashMap<_, u16, u8> = (&mut m).try_into()?;
@@ -264,7 +254,7 @@ mod tests {
         assert_eq!(u32::from_be(w[3]), 2);
     }
 
-    /// The value `connect6` compares against for "no v6 target configured".
+    /// What `connect6` compares against for "no v6 target configured".
     #[test]
     fn the_unspecified_address_is_all_zero_words() {
         assert_eq!(v6_words(std::net::Ipv6Addr::UNSPECIFIED), [0; 4]);
@@ -277,8 +267,6 @@ mod tests {
         assert_ne!(CLIENT_READY_FILE, SERVER_READY_FILE);
     }
 
-    /// Every program the client attaches must exist in the object, or `attach` fails at runtime
-    /// with a name nobody can grep for.
     #[test]
     fn every_client_program_is_present_in_the_embedded_object() {
         let obj = aya_obj::Object::parse(OBJECT).expect("the embedded object parses");
@@ -315,8 +303,6 @@ mod tests {
         }
     }
 
-    /// The failure this guards against is intermittent and its error message points nowhere useful,
-    /// so it is asserted rather than assumed on every build.
     #[test]
     fn the_embedded_object_is_aligned() {
         assert_object_aligned().expect("aligned");

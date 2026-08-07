@@ -1,13 +1,9 @@
-//! Two commands, one shared secret, and a tunnel needlecast creates and owns.
-//!
 //! ```text
 //! needlecast server ./secret cesium.gio.ninja     # on the machine with the dev servers
 //! needlecast client ./secret cadmium.gio.ninja    # on the machine you are typing at
 //! ```
 //!
-//! Each side is given the *other* machine's name — above, the desktop is `cadmium` and the laptop
-//! is `cesium`. That is the whole configuration: no pairing step, no config file, no state
-//! directory.
+//! Each side is given the *other* machine's name. That is the whole configuration.
 
 mod bpf;
 mod client;
@@ -32,8 +28,7 @@ use needlecast_common::{ev, prog, tc, tcev, COUNTER_SLOTS, TC_COUNTER_SLOTS};
 
 use transport::DEFAULT_LISTEN_PORT;
 
-/// The default managed range. Everything outside it is never touched on either side, which is the
-/// only limit on what the server exposes — so keep anything you do not want reachable outside it.
+/// The only limit on what the server exposes: keep anything you do not want reachable outside it.
 const DEFAULT_PORT_LO: u16 = 8000;
 const DEFAULT_PORT_HI: u16 = 8999;
 
@@ -81,21 +76,21 @@ enum Command {
         /// Control port, inside the tunnel.
         #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
         control_port: u16,
-        /// TCP_SYNCNT for rewritten sockets. Caps how long a connection hangs when the server
-        /// vanishes between heartbeats. Zero leaves the system default of about two minutes.
+        /// Caps how long a connection hangs when the server vanishes between heartbeats. Zero
+        /// leaves the system default of about two minutes.
         #[arg(long, default_value_t = 2)]
         syncnt: u8,
     },
     /// Report what this machine is doing. Reads kernel and filesystem state directly, so it works
-    /// when the daemon is wedged or dead — which is when it is worth having.
+    /// when the daemon is wedged or dead.
     Status {
-        /// Which half runs here. Both, if you are checking a machine that runs both.
+        /// Which half runs here.
         #[arg(long, value_enum, default_value = "auto")]
         role: StatusRole,
     },
-    /// Print both public keys derived from a secret file. Run it on each machine: if the two
-    /// outputs differ, the secrets differ, which is the failure the tunnel would otherwise report
-    /// only as a handshake that never completes.
+    /// Print both public keys derived from a secret file. Run it on each machine: differing output
+    /// means differing secrets, which the tunnel would otherwise report only as a handshake that
+    /// never completes.
     Keys {
         /// The shared secret. Must not be readable by anyone but its owner.
         secret: PathBuf,
@@ -103,8 +98,7 @@ enum Command {
     /// Diagnostics: read the pinned maps and inspect the embedded object.
     #[command(subcommand)]
     Dev(DevCommand),
-    /// Test scaffolding, compiled only with `--features testing`. Drives one half of the system in
-    /// isolation, which the shipped binary deliberately cannot do.
+    /// Test scaffolding, compiled only with `--features testing`.
     #[cfg(feature = "testing")]
     #[command(subcommand)]
     Harness(harness::Command),
@@ -119,17 +113,14 @@ pub enum StatusRole {
 
 #[derive(Subcommand)]
 enum DevCommand {
-    /// Print every non-zero client counter as `program.event=count`.
+    /// Every non-zero client counter, as `program.event=count`.
     Counters,
-    /// Print every non-zero server counter as `program.event=count`.
+    /// Every non-zero server counter.
     TcCounters,
-    /// Print the loaded client configuration.
     ShowConfig,
-    /// Flip the enabled flag without restarting the daemon.
     SetEnabled { value: u8 },
     /// Populate DESKTOP_PORTS.
     Advertise { ports: Vec<u16> },
-    /// Remove entries from DESKTOP_PORTS.
     Withdraw { ports: Vec<u16> },
     /// Print the ports this machine is serving, as the control plane would publish them.
     Listeners,
@@ -138,10 +129,9 @@ enum DevCommand {
     /// Parse an object without touching the kernel. Defaults to the embedded one. Unprivileged.
     VerifyObject { path: Option<PathBuf> },
     /// Prove the embedded object is aligned, and that misalignment is what breaks the parser.
-    /// Unprivileged. Exits non-zero if either half of that does not hold.
+    /// Exits non-zero if either half does not hold.
     AlignmentCheck,
-    /// Try loading and attaching only the setsockopt probe. Exits non-zero if the verifier
-    /// rejected it.
+    /// Load and attach only the setsockopt probe. Exits non-zero if the verifier rejected it.
     ProbeSyncnt,
 }
 
@@ -244,7 +234,6 @@ mod tests {
         }
     }
 
-    /// The shipped binary must not be able to express any test scaffolding.
     #[cfg(not(feature = "testing"))]
     #[test]
     fn the_harness_is_absent_without_the_testing_feature() {
@@ -267,8 +256,7 @@ mod tests {
     #[test]
     fn the_default_range_is_the_one_the_design_documents() {
         assert_eq!((DEFAULT_PORT_LO, DEFAULT_PORT_HI), (8000, 8999));
-        // The control and WireGuard ports must sit outside it, or the control plane would forward
-        // itself.
+        // Or the control plane would forward itself.
         for port in [DEFAULT_CONTROL_PORT, DEFAULT_LISTEN_PORT] {
             assert!(
                 !(DEFAULT_PORT_LO..=DEFAULT_PORT_HI).contains(&port),

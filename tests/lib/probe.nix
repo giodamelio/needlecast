@@ -1,7 +1,6 @@
 {pkgs}:
-# Small socket probe used by every scenario. It reports what the kernel tells the application —
-# which server answered, and what getpeername()/recvfrom() say the peer was — because that is
-# exactly what the BPF programs are supposed to shape.
+# Reports what the kernel tells the *application* — which server answered, and what
+# getpeername()/recvfrom() say the peer was — because that is what the BPF programs shape.
 pkgs.writeScriptBin "nc-probe" ''
   #!${pkgs.python3}/bin/python3
   import argparse, errno, os, socket, struct, sys, threading, time
@@ -40,12 +39,11 @@ pkgs.writeScriptBin "nc-probe" ''
               data, peer = s.recvfrom(65535)
               s.sendto(a.token.encode() + b":" + data, peer)
       else:
-          # Large enough that the concurrency cases exercise needlecast rather than this backlog.
+          # Large enough that the concurrency cases exercise needlecast, not this backlog.
           s.listen(256)
           while True:
               c, peer = s.accept()
-              # What the application is told, which is what "the server cannot tell" means. This
-              # is not necessarily what ss reports.
+              # Not necessarily what `ss` reports, which is the whole point.
               print("accepted_peer=%s:%d" % (peer[0], peer[1]), flush=True)
               print("getpeername=%s:%d" % (c.getpeername()[0], c.getpeername()[1]), flush=True)
               threading.Thread(target=lambda c=c: send_all(c, a), daemon=True).start()
@@ -57,7 +55,7 @@ pkgs.writeScriptBin "nc-probe" ''
 
   def make_payload(a):
       if a.payload_size:
-          # Deterministic and non-uniform, so a truncated or reordered datagram is detectable.
+          # Non-uniform, so a truncated or reordered datagram is detectable.
           return bytes((i * 7 + 13) % 256 for i in range(a.payload_size))
       return a.payload.encode()
 
@@ -106,8 +104,7 @@ pkgs.writeScriptBin "nc-probe" ''
       s.settimeout(a.timeout)
       try:
           if a.udp and a.unconnected:
-              # Every datagram goes out the same socket, so --gate lets a test change the world
-              # between them and observe whether the decision is re-made.
+              # One socket, so `--gate` lets a test change the world between datagrams.
               for i in range(1, a.repeat + 1):
                   if i > 1 and a.gate:
                       deadline = time.monotonic() + a.timeout
@@ -140,8 +137,8 @@ pkgs.writeScriptBin "nc-probe" ''
               print("data=" + data.decode())
               return 0
           if a.out:
-              # Bulk read to EOF. The digest is left to sha256sum in the test so the comparison is
-              # against the file the server actually sent, not against anything this script derived.
+              # The digest is left to the test, so it compares against the file the server sent
+              # rather than anything derived here.
               total = 0
               with open(a.out, "wb") as fh:
                   while True:
@@ -153,8 +150,7 @@ pkgs.writeScriptBin "nc-probe" ''
               print("bytes=%d" % total)
               return 0
           if a.half_close:
-              # Shut down our write side and keep reading: a tool that does this must not have the
-              # connection torn down under it.
+              # A tool that half-closes must not have the connection torn down under it.
               s.shutdown(socket.SHUT_WR)
           data = s.recv(65535)
           print("data=" + data.decode(), flush=True)
@@ -165,8 +161,7 @@ pkgs.writeScriptBin "nc-probe" ''
               time.sleep(a.hold)
           return 0
       except socket.timeout:
-          # A silently dropped SYN looks like this, and it is a materially different finding from
-          # a refusal, so do not let it print as "error=None".
+          # A dropped SYN is a materially different finding from a refusal.
           print("error=TIMEOUT")
           return 3
       except OSError as e:

@@ -8,9 +8,8 @@
   s = import ./lib/scenarios.nix {inherit pkgs;};
   common = s.node {inherit kernelPackages needlecast;};
 in
-  # No WireGuard is declared anywhere in this file. Every previous suite had the harness create the
-  # tunnel; this is the first one where needlecast creates it, from nothing but a secret and a
-  # machine name.
+  # No WireGuard is declared anywhere here: needlecast creates the tunnel from nothing but a secret
+  # and a machine name.
   testers.runNixOSTest {
     name = "needlecast-transport-${variant}";
 
@@ -29,8 +28,7 @@ in
       with subtest("neither machine has an interface before needlecast runs"):
           for m in (server, client):
               m.fail(f"ip link show {IFACE}")
-              # The sysctl directory lives and dies with the interface, so its absence is the
-              # cleanest proof that nothing has been configured.
+              # It lives and dies with the interface, so its absence proves nothing is configured.
               m.fail(f"test -e /proc/sys/net/ipv4/conf/{IFACE}/route_localnet")
 
       with subtest("both sides derive the same two keys from the same file"):
@@ -86,19 +84,19 @@ in
 
       with subtest("only the server sets route_localnet, and only on its own interface"):
           assert server.succeed(f"sysctl -n net.ipv4.conf.{IFACE}.route_localnet").strip() == "1"
-          # The client delivers nothing to loopback, so it needs nothing.
+          # The client delivers nothing to loopback.
           assert client.succeed(f"sysctl -n net.ipv4.conf.{IFACE}.route_localnet").strip() == "0"
           for m in (server, client):
               for key in ("all", "lo", "default"):
                   assert m.succeed(f"sysctl -n net.ipv4.conf.{key}.route_localnet").strip() == "0", key
 
       with subtest("only the client sends keepalives"):
-          # The server has the stable address; keeping a path open through NAT is the client's job.
+          # The server has the stable address, so the NAT hole is the client's to hold open.
           assert "off" in server.succeed(f"wg show {IFACE} persistent-keepalive"), "server"
           assert "25" in client.succeed(f"wg show {IFACE} persistent-keepalive"), "client"
 
       with subtest("a restart adopts a leftover interface rather than failing"):
-          # Kill without letting it clean up, which is what a crash looks like.
+          # Without letting it clean up, as a crash would.
           client.succeed("systemctl kill -s SIGKILL ncclient.service || true")
           client.wait_until_fails("systemctl is-active ncclient.service", timeout=30)
           client.succeed(f"ip link show {IFACE}")  # still there, as after a crash
@@ -120,7 +118,7 @@ in
           server.fail(f"test -e /proc/sys/net/ipv4/conf/{IFACE}/route_localnet")
 
       with subtest("an unresolvable peer is survivable, not fatal"):
-          # The interface is still worth having up so the peer can reach *us* when it returns.
+          # Still worth having up so the peer can reach *us* when it returns.
           start_client(client, peer="nonexistent.invalid", unit="ncorphan")
           client.succeed(f"ip link show {IFACE}")
           assert "(none)" in client.succeed(f"wg show {IFACE} endpoints") or \

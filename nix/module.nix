@@ -6,12 +6,10 @@
 }: let
   cfg = config.services.needlecast;
 
-  # `EX_CONFIG` from sysexits. needlecast exits with this on a protocol version mismatch, which is
-  # fatal by design — so the unit must let the failure be loud and *stationary* rather than turning
-  # it into a crash loop.
+  # `EX_CONFIG`. needlecast exits with this on a version mismatch, which retrying cannot fix.
   exitVersionMismatch = 78;
 
-  # The interface needlecast creates. Hardcoded in the daemon too — it is not a knob.
+  # Hardcoded in the daemon too: not a knob.
   ifaceName = "needle";
 
   half = role: c: let
@@ -35,15 +33,13 @@
       ExecStart = lib.escapeShellArgs args;
       Restart = "always";
       RestartSec = 2;
-      # A version mismatch means the two machines disagree about the protocol. Retrying cannot fix
-      # that, and a crash loop would bury the one log line that explains it.
+      # A crash loop would bury the one log line that explains it.
       RestartPreventExitStatus = toString exitVersionMismatch;
 
-      # The secret never appears in the store or in a world-readable path.
+      # So the secret never appears in the store or on the command line.
       LoadCredential = "secret:${c.secretFile}";
 
-      # needlecast creates a WireGuard interface, loads BPF programs, attaches them to the root
-      # cgroup, and writes one sysctl on its own interface. That is the whole capability set.
+      # Interface, BPF load, cgroup attach, one sysctl. That is the whole capability set.
       AmbientCapabilities = [
         "CAP_NET_ADMIN"
         "CAP_BPF"
@@ -88,12 +84,12 @@
         type = lib.types.path;
         example = "/var/lib/needlecast/secret";
         description = ''
-          Path to the shared secret. The same file must be on both machines: each side derives
-          both keypairs from it, so there is nothing to exchange.
+          The shared secret, identical on both machines: each side derives both keypairs from it,
+          so there is nothing to exchange.
 
-          Generate it once with `head -c 32 /dev/urandom | base64 > secret`. Anyone holding it can
-          impersonate either side, so keep it out of the store and off shared filesystems — a lost
-          laptop is a rotate-the-secret event.
+          Generate it with `head -c 32 /dev/urandom | base64 > secret`. Anyone holding it can
+          impersonate either side, so keep it out of the store — a lost laptop is a
+          rotate-the-secret event.
         '';
       };
 
@@ -119,21 +115,15 @@
         type = lib.types.bool;
         default = true;
         description = ''
-          Open the ports needlecast needs, using the ordinary `networking.firewall` options — no
-          hand-written `iptables` or `nftables` rules, and nothing that depends on which backend
-          you run.
-
-          The WireGuard port, on both halves, so whichever machine is reachable first can start the
-          handshake. On the server, additionally the managed port range and the control port, scoped
-          to the tunnel interface.
+          Open the ports needlecast needs, using ordinary `networking.firewall` options: the
+          WireGuard port on both halves, plus the managed range and the control port on the
+          server's tunnel interface.
 
           Deliberately *not* `trustedInterfaces`, which would also expose every service bound to
-          `0.0.0.0` on ports outside the managed range and break the guarantee that the range is the
-          only limit.
+          `0.0.0.0` outside the managed range.
 
-          On a machine that is not NixOS, the equivalent is: allow inbound UDP on the WireGuard
-          port, and on the `needle` interface allow inbound TCP and UDP for the managed range plus
-          TCP on the control port.
+          Elsewhere the equivalent is: allow inbound UDP on the WireGuard port, and on `needle`
+          allow inbound TCP and UDP for the managed range plus TCP on the control port.
         '';
       };
     }
@@ -153,11 +143,9 @@
         };
         default = {};
         description = ''
-          The loopback ports this machine serves to the client.
-
-          Every port in the range becomes reachable to anyone holding the secret. This range is the
-          only limit — there is no per-port allowlist — so keep anything you do not want reachable
-          outside it.
+          The loopback ports this machine serves to the client. Every one of them is reachable to
+          anyone holding the secret, and this range is the only limit — there is no per-port
+          allowlist — so keep anything you do not want reachable outside it.
         '';
       };
     }
@@ -166,9 +154,8 @@
         type = lib.types.ints.between 0 255;
         default = 2;
         description = ''
-          `TCP_SYNCNT` for rewritten sockets. Caps how long a connection hangs when the server
-          vanishes between heartbeats: a few seconds instead of the stock two minutes. Zero leaves
-          the system default.
+          `TCP_SYNCNT` for rewritten sockets: a few seconds instead of the stock two minutes when
+          the server vanishes between heartbeats. Zero leaves the system default.
         '';
       };
     };
@@ -202,8 +189,7 @@ in {
       // lib.optionalAttrs cfg.client.enable {needlecast-client = half "client" cfg.client;};
 
     networking.firewall = let
-      # Both halves listen for WireGuard, so whichever machine is reachable first can be the one
-      # that initiates the handshake.
+      # Both halves listen, so whichever is reachable first can start the handshake.
       wgPorts =
         lib.optionals (cfg.server.enable && cfg.server.openFirewall) [cfg.server.listenPort]
         ++ lib.optionals (cfg.client.enable && cfg.client.openFirewall) [cfg.client.listenPort];
@@ -217,9 +203,8 @@ in {
         allowedUDPPorts = wgPorts;
       }
       // lib.optionalAttrs (cfg.server.enable && cfg.server.openFirewall) {
-        # Scoped to the tunnel interface, and to the ports needlecast actually forwards. Ports are
-        # never translated, so the destination port of a forwarded packet is the one the client
-        # asked for — which means the managed range is exactly the right filter and the range stays
+        # Ports are never translated, so a forwarded packet's destination port is the one the
+        # client asked for — which makes the managed range exactly the right filter, and keeps it
         # the only limit on what the secret grants.
         interfaces.${ifaceName} = {
           allowedTCPPorts = [cfg.server.controlPort];

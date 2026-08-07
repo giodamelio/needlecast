@@ -5,18 +5,14 @@
 //! cargo nextest run --profile vm -E 'test(endtoend)'
 //! ```
 //!
-//! Each test shells out to `nix build` for one flake check. That is the same thing `nix flake
-//! check` does, so nothing here duplicates the assertions — it exists so one runner covers both
-//! layers, and so a single suite can be re-run by name without remembering the attribute path.
-//!
-//! These boot real machines and take minutes. The default nextest profile excludes them; plain
-//! `cargo test` does not, so use nextest.
+//! Each shells out to `nix build` for one flake check, so nothing here duplicates the assertions —
+//! it exists so one runner covers both layers. They boot real machines and take minutes; the
+//! default nextest profile excludes them, plain `cargo test` does not.
 
 use std::process::Command;
 
-/// Every suite, each built for both kernels below. Kept in sync with the flake by
-/// `the_suite_list_matches_the_flake`, so a suite added there and forgotten here is a test failure
-/// rather than silent under-coverage.
+/// Kept in sync with the flake by `the_suite_list_matches_the_flake`, so a suite added there and
+/// forgotten here is a failure rather than silent under-coverage.
 const SUITES: &[&str] = &[
     // The product surface: the shipped binary, a secret file, and a machine name.
     "transport",
@@ -33,13 +29,11 @@ const SUITES: &[&str] = &[
     "datapath-wireguard",
 ];
 
-/// 6.18 is the kernel this is developed against; latest is a forward-compatibility check. A helper
-/// being permitted in one and not the other is exactly the kind of thing that would otherwise only
-/// show up on the target machine.
+/// 6.18 is the target; latest is a forward-compatibility check. A helper permitted in one and not
+/// the other would otherwise show up only on the machine you actually run.
 const KERNELS: &[&str] = &["6_18", "latest"];
 
-/// Checks that are not a suite × kernel cross-product. `demo` exists to be booted rather than to
-/// catch regressions, so it runs on the target kernel only.
+/// Not a suite × kernel cross-product: `demo` exists to be booted, so it runs on 6.18 only.
 const STANDALONE: &[&str] = &["demo"];
 
 fn system() -> &'static str {
@@ -79,8 +73,6 @@ fn build_check(name: &str) {
     }
 }
 
-/// The list above is hand-maintained, so a suite added to the flake and forgotten here would run
-/// under `nix flake check` and silently not under nextest. This is what catches that.
 #[test]
 fn the_suite_list_matches_the_flake() {
     let attr = format!(".#checks.{}", system());

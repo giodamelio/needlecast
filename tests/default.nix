@@ -6,9 +6,8 @@
 }: let
   inherit (pkgs.lib) concatMapAttrs;
 
-  # 6.18 is the kernel this is actually developed against; latest is a forward-compatibility check.
-  # Both must pass — a helper being permitted in one and not the other is exactly the kind of thing
-  # that would otherwise only show up on the target machine.
+  # 6.18 is the target; latest is a forward-compatibility check. A helper permitted in one and not
+  # the other would otherwise show up only on the machine you actually run.
   kernels = {
     "6_18" = pkgs.linuxKernel.packages.linux_6_18;
     latest = pkgs.linuxPackages_latest;
@@ -17,8 +16,7 @@
   perKernel = f:
     concatMapAttrs (variant: kernelPackages: f variant kernelPackages) kernels;
 
-  # Suites that drive the shipped binary — the product surface, secret file and all. Nothing
-  # feature-gated can be load bearing for anything proved here.
+  # The shipped binary, so nothing feature-gated can be load bearing for what these prove.
   productSuites = {
     transport = ./transport.nix;
     endtoend = ./endtoend.nix;
@@ -28,7 +26,7 @@
     resilience = ./resilience.nix;
   };
 
-  # Suites that isolate one half of the system, which the shipped binary deliberately cannot do.
+  # One half in isolation, which the shipped binary deliberately cannot do.
   harnessSuites = {
     laptop = ./laptop.nix;
     isolation = ./isolation.nix;
@@ -40,14 +38,12 @@ in
         pkgs.callPackage path {inherit needlecast kernelPackages variant;};
     }))
   productSuites
-  # The module suite builds its nodes from the module rather than from `systemd-run`, which is the
-  # only thing that proves the module and the daemon's flags agree.
+  # From the module rather than `systemd-run` — the only thing that proves the two agree.
   // perKernel (variant: kernelPackages: {
     "module-${variant}" =
       pkgs.callPackage ./module.nix {inherit needlecast kernelPackages variant module;};
   })
-  # The demo is the thing you boot, not a regression net: it duplicates what `module` already
-  # asserts, so it runs on the target kernel only.
+  # The thing you boot rather than a regression net, so one kernel is enough.
   // {
     demo = pkgs.callPackage ./demo.nix {
       inherit needlecast module;
@@ -63,9 +59,8 @@ in
       };
     }))
   harnessSuites
-  # The datapath runs the same assertions over plain ethernet and over WireGuard, so the transport
-  # is one variable changed rather than a second test. Both use the testing build: the ethernet
-  # variant is the only coverage of the ARPHRD_ETHER L3 offset, which the product never sees.
+  # The same assertions over both transports, so it is one variable changed rather than a second
+  # test. The ethernet variant is the only coverage of the ARPHRD_ETHER L3 offset.
   // concatMapAttrs (transport: _:
     perKernel (variant: kernelPackages: {
       "datapath-${transport}-${variant}" = pkgs.callPackage ./datapath.nix {

@@ -1,8 +1,7 @@
 {lib}: let
   root = ../.;
-  # Matched against the path relative to the repo root, not the basename: `tests/` at the top level
-  # is the NixOS suites, which no Rust build needs, but `crates/*/tests/` is the Rust integration
-  # tests, which every Rust build does.
+  # Relative to the repo root, not by basename: top-level `tests/` is the NixOS suites, but
+  # `crates/*/tests/` is the Rust integration tests.
   ignored = [
     ".direnv"
     ".git"
@@ -19,8 +18,7 @@ in
     src = root;
     filter = path: type: let
       rel = lib.removePrefix prefix (toString path);
-      # The design documents at the top level are not build inputs. Leaving them in would make
-      # every edit to a comment rebuild the package and, through it, all twenty-two VM tests.
+      # Not build inputs; leaving them in makes a doc edit rebuild every VM test.
       isTopLevelDoc = !(lib.hasInfix "/" rel) && lib.hasSuffix ".md" rel;
     in
       !(builtins.elem rel ignored) && !isTopLevelDoc && lib.cleanSourceFilter path type;

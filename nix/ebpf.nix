@@ -24,10 +24,9 @@ stdenv.mkDerivation {
     bpf-linker
   ];
 
-  # nixpkgs rustc is stable and already ships a prebuilt core for bpfel-unknown-none, so the only
-  # thing missing is aya-ebpf's one nightly feature.
-  # The target and rustflags come from crates/ebpf/.cargo/config.toml, which cargoSetupHook
-  # preserves.
+  # nixpkgs rustc already ships a prebuilt core for bpfel-unknown-none, so the only thing missing is
+  # aya-ebpf's one nightly feature. Target and rustflags come from crates/ebpf/.cargo/config.toml,
+  # which cargoSetupHook preserves.
   RUSTC_BOOTSTRAP = "1";
 
   buildPhase = ''

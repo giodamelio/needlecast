@@ -8,8 +8,7 @@
   s = import ./lib/scenarios.nix {inherit pkgs;};
   common = s.node {inherit kernelPackages needlecast;};
 in
-  # Both halves together, driven exactly as a person would drive them: two commands, one secret,
-  # and a machine name each. Nothing here ever names the server's address.
+  # Driven exactly as a person would: two commands, one secret, a machine name each.
   testers.runNixOSTest {
     name = "needlecast-endtoend-${variant}";
 

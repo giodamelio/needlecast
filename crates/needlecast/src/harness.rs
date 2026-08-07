@@ -1,17 +1,7 @@
 //! Test scaffolding, compiled only with `--features testing`.
 //!
-//! `needlecast server` and `needlecast client` deliberately fuse three things: the identity, the
-//! tunnel, and the datapath. That is right for the product and wrong for a regression suite, which
-//! needs to change one variable at a time. These commands drive one half in isolation:
-//!
-//! - `bridge` is the client's decision path with an explicit target and no control plane, which
-//!   keeps the eight `cgroup_sock_addr` programs testable on a single machine.
-//! - `datapath` is the server's tc programs on an interface the harness created, which is the only
-//!   coverage of the `ARPHRD_ETHER` L3 offset — the shipped binary only ever attaches to `needle`,
-//!   which is `ARPHRD_NONE`.
-//!
-//! Nothing here is reachable from a binary built without the feature, so none of it can quietly
-//! become load bearing for the real thing.
+//! `server` and `client` fuse the identity, the tunnel and the datapath — right for the product,
+//! wrong for a suite that needs to change one variable at a time. These drive one half alone.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -24,21 +14,19 @@ use crate::shutdown::Shutdown;
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// The client's decision path alone: attach, enable against a fixed target, and hold.
+    /// The client's decision path alone, against a fixed target and no control plane.
     Bridge {
-        /// Where a connection with no local listener is sent.
         #[arg(long)]
         target_v4: Ipv4Addr,
-        /// The IPv6 counterpart. The shipped client has none — the tunnel is v4-only — so this is
-        /// the only way to exercise the complete `connect6` / `getpeername6` path.
+        /// The shipped client has none, so this is the only way to exercise `connect6`.
         #[arg(long)]
         target_v6: Option<Ipv6Addr>,
         #[arg(long, default_value_t = 8000)]
         port_lo: u16,
         #[arg(long, default_value_t = 8999)]
         port_hi: u16,
-        /// Drop the netns cookie guard. The negative control for the isolation suite: without it
-        /// every other assertion there would still pass with the guard deleted.
+        /// The isolation suite's negative control: without it every other assertion there would
+        /// still pass with the guard deleted.
         #[arg(long)]
         no_netns_guard: bool,
         /// Require a port to be present in DESKTOP_PORTS before rewriting.
@@ -50,16 +38,13 @@ pub enum Command {
         #[arg(long)]
         syncnt_probe: bool,
     },
-    /// The server's datapath alone: attach to an interface someone else created and hold.
+    /// The server's datapath alone, on an interface someone else created. An ethernet link is the
+    /// only coverage of the `ARPHRD_ETHER` L3 offset, which the product never sees.
     Datapath {
-        /// The transport interface. An ethernet link exercises the L3 offset the product never
-        /// sees.
         #[arg(long)]
         iface: String,
-        /// This machine's address on that link.
         #[arg(long)]
         transport_v4: Ipv4Addr,
-        /// The peer's address on that link.
         #[arg(long)]
         transport_peer_v4: Ipv4Addr,
         #[arg(long, default_value_t = 8000)]
@@ -95,7 +80,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 port_lo,
                 port_hi,
                 netns_guard: !no_netns_guard,
-                // No control plane here, so nothing else would ever enable it.
+                // Nothing else would ever enable it: there is no control plane here.
                 enabled: true,
                 syncnt_probe,
             })?;
@@ -131,7 +116,6 @@ pub fn run(cmd: Command) -> Result<()> {
     }
 }
 
-/// The links live in the value the caller holds; dropping it, or dying, detaches everything.
 fn hold(shutdown: &Shutdown) {
     while !shutdown.requested() {
         shutdown.sleep(std::time::Duration::from_secs(1));

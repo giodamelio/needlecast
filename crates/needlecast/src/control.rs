@@ -1,12 +1,8 @@
-//! The control plane.
-//!
 //! Plain TCP over the tunnel. WireGuard authenticates it and the peer's identity *is* its tunnel
-//! source address, so there is no TLS, no certificate and no token.
+//! source address, so there is no TLS and no token.
 //!
-//! Its one load-bearing job is liveness. Without it `connect4` keeps rewriting toward a server that
-//! is gone, and the connection hangs on SYN retransmit instead of failing. The listener feed is a
-//! latency optimisation on top: the server already refuses unserved ports correctly on its own,
-//! this just saves the round trip.
+//! Its one load-bearing job is liveness: without it the client keeps rewriting toward a server that
+//! is gone, and connections hang on SYN retransmit instead of failing.
 
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind, Read, Write};
@@ -14,40 +10,27 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-// `MAGIC` and `EXIT_VERSION_MISMATCH` live in `common` because they are part of the contract two
-// *different builds* have to agree on, so tests outside this crate must be able to name them.
 pub use needlecast_common::proto::EXIT_VERSION_MISMATCH;
 use needlecast_common::proto::{wire, Msg, MAGIC, VERSION};
 
 use crate::shutdown::Shutdown;
 
-/// Fast while a forwarded connection is open, because that is when a stale enabled flag costs
-/// something. See [`IDLE_PING_INTERVAL`] for the other half.
+/// A stale enabled flag only costs something while a connection is open, so the heartbeat is fast
+/// then and slow otherwise.
 pub const PING_INTERVAL: Duration = Duration::from_secs(1);
-
-/// With nothing forwarded there is nothing to protect, so the heartbeat backs off to this. One
-/// packet every thirty seconds is not measurable against anything else a laptop is doing, and the
-/// `TCP_SYNCNT` cap bounds the worst case of a stale flag to a few seconds anyway.
-///
-/// Tearing the tunnel down instead would not trade latency for battery — it would trade a
-/// *failed* first connection, because the decision is made synchronously inside `connect()` and
-/// cannot wait for a tunnel to come up.
 pub const IDLE_PING_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Three missed pings at whatever the current interval is.
 pub const LIVENESS_MULTIPLIER: u32 = 3;
 
-/// How long the server tolerates silence before closing. Generous against the slowest heartbeat,
-/// because a suspended laptop would otherwise leave a thread blocked on a socket that will never
-/// speak again — reaped only by TCP keepalive, which defaults to two hours.
+/// Must exceed the client's slowest liveness deadline, or an idle laptop is disconnected on a timer
+/// rather than because anything is wrong. Without it a suspended one holds a thread until TCP
+/// keepalive notices, which takes two hours.
 pub const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Socket read timeout. Deliberately much shorter than any liveness deadline: both sides must be
-/// able to act on their own timers, so a read returning empty has to be routine rather than fatal.
+/// Both sides act on their own timers, so a read returning empty has to be routine rather than
+/// fatal — which means this must stay well under any deadline.
 pub const POLL: Duration = Duration::from_millis(250);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// How often the server re-reads its own listening sockets.
 pub const LISTENER_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,7 +52,7 @@ impl std::fmt::Display for VersionMismatch {
 
 impl std::error::Error for VersionMismatch {}
 
-/// True when a read returned simply because nothing had arrived yet.
+/// Nothing had arrived yet, as opposed to anything being wrong.
 pub fn is_idle(e: &io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
@@ -80,8 +63,7 @@ fn write_preamble(w: &mut impl Write, version: u32) -> io::Result<()> {
     w.flush()
 }
 
-/// Reads the peer's preamble, retrying while the socket is merely idle so a short read timeout does
-/// not look like a failed handshake.
+/// Retries while the socket is merely idle, so [`POLL`] does not look like a failed handshake.
 fn read_preamble(r: &mut impl Read, deadline: Duration) -> Result<u32> {
     let mut buf = [0u8; 8];
     let mut got = 0;
@@ -108,8 +90,8 @@ fn read_preamble(r: &mut impl Read, deadline: Duration) -> Result<u32> {
     Ok(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]))
 }
 
-/// Exchange versions. Both sides send unconditionally before comparing, so each can name the other
-/// in its error rather than reporting an unexplained disconnect.
+/// Both sides send before either compares, so each can name the other's version in its error
+/// rather than reporting an unexplained disconnect.
 pub fn exchange_version(stream: &mut TcpStream, deadline: Duration) -> Result<()> {
     write_preamble(stream, VERSION)?;
     let mut reader = stream.try_clone()?;
@@ -124,8 +106,7 @@ pub fn exchange_version(stream: &mut TcpStream, deadline: Duration) -> Result<()
     Ok(())
 }
 
-/// Ports this machine is serving on any address reachable through its own loopback: `127.0.0.1`,
-/// `0.0.0.0`, `::1` and `::` are all reachable there, so all four count.
+/// Ports reachable through this machine's own loopback, which includes wildcard binds.
 pub fn local_listeners() -> Result<BTreeSet<u16>> {
     let mut ports = BTreeSet::new();
     // TCP_LISTEN for TCP; a bound UDP socket sits in TCP_CLOSE.
@@ -165,10 +146,7 @@ fn parse_proc_net(text: &str, want_state: u8) -> Vec<u16> {
     ports
 }
 
-/// Established connections whose peer is `peer`, as `(local_port, peer_port)`.
-///
-/// Used to decide whether anything is riding the tunnel right now, which is what makes the
-/// heartbeat adaptive, and by `status` to list what is forwarded.
+/// Established connections to `peer`, as `(local_port, peer_port)`.
 pub fn established_with(peer: Ipv4Addr) -> Vec<(u16, u16)> {
     const TCP_ESTABLISHED: u8 = 0x01;
     let Ok(text) = std::fs::read_to_string("/proc/net/tcp") else {
@@ -207,8 +185,7 @@ fn parse_established(text: &str, peer: Ipv4Addr, want_state: u8) -> Vec<(u16, u1
     out
 }
 
-/// Server side. Answers heartbeats and publishes the listener set; holds no state about the client,
-/// so a client that vanishes needs no cleanup here.
+/// Holds no state about the client, so one that vanishes needs no cleanup here.
 pub fn serve(
     bind: Ipv4Addr,
     port: u16,
@@ -227,8 +204,7 @@ pub fn serve(
                 std::thread::spawn(move || match serve_one(stream, port_lo, port_hi) {
                     Ok(()) => log::info!("{peer}: control connection ended"),
                     Err(e) => match e.downcast_ref::<VersionMismatch>() {
-                        // Fatal on both sides, by design: no negotiation, no compatibility shim,
-                        // no silently-degraded mode.
+                        // Fatal by design: no negotiation, no compatibility shim.
                         Some(m) => {
                             log::error!("{peer}: {m}");
                             std::process::exit(EXIT_VERSION_MISMATCH);
@@ -257,9 +233,7 @@ fn serve_one(mut stream: TcpStream, port_lo: u16, port_hi: u16) -> Result<()> {
         .checked_sub(LISTENER_POLL)
         .unwrap_or_else(Instant::now);
     loop {
-        // Publish before blocking on a read, so the first snapshot arrives without waiting for a
-        // heartbeat round trip. Full sets rather than deltas, so a dropped update cannot leave the
-        // two sides disagreeing indefinitely.
+        // Before the read, so the first snapshot does not wait for a heartbeat round trip.
         if last_scan.elapsed() >= LISTENER_POLL {
             last_scan = Instant::now();
             let now: BTreeSet<u16> = local_listeners()?
@@ -296,20 +270,14 @@ fn serve_one(mut stream: TcpStream, port_lo: u16, port_hi: u16) -> Result<()> {
     }
 }
 
-/// What the heartbeat wants done this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Beat {
-    /// Nothing due yet.
     Wait,
-    /// Send a `Ping`.
     Ping,
-    /// Nothing heard for three intervals: treat the peer as gone.
     Expired,
 }
 
-/// The adaptive heartbeat: fast while a forwarded connection is open, slow when none is.
-///
-/// Separated from the socket so the timing is testable without waiting in real time — every method
+/// Separated from the socket so the timing is testable without waiting in real time: every method
 /// takes the current instant rather than reading the clock.
 pub struct Heartbeat {
     interval: Duration,
@@ -330,10 +298,8 @@ impl Heartbeat {
         self.last_heard = now;
     }
 
-    /// `active` is whether anything is riding the tunnel. Shortening the interval also brings the
-    /// liveness deadline in, so a stale enabled flag is noticed quickly exactly when it matters;
-    /// lengthening it must not retroactively expire a connection that was fine a moment ago, which
-    /// is why the deadline is always measured from the *current* interval.
+    /// The deadline is derived from whatever interval is in force *now*, so relaxing it cannot
+    /// retroactively expire a connection that was healthy a moment ago.
     pub fn set_active(&mut self, active: bool) {
         self.interval = if active {
             PING_INTERVAL
@@ -362,15 +328,14 @@ impl Heartbeat {
     }
 }
 
-/// What the client learned from one successful handshake.
 pub struct Session {
     pub stream: TcpStream,
     pub port_lo: u16,
     pub port_hi: u16,
 }
 
-/// Client side. Dials and completes the handshake; the caller owns the enabled flag, because the
-/// ordering of clearing it matters more than anything else in this module.
+/// The caller owns the enabled flag: the order it is cleared in matters more than anything else
+/// here.
 pub fn dial(addr: SocketAddr) -> Result<Session> {
     let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .with_context(|| format!("dialling {addr}"))?;
@@ -416,8 +381,6 @@ mod tests {
         assert!(parse_proc_net(text, 0x0A).is_empty());
     }
 
-    /// IPv6 rows carry a 32-hex-digit address, so splitting on the *last* colon is what keeps the
-    /// port readable.
     #[test]
     fn ipv6_listen_lines_parse() {
         let text = "\
@@ -493,8 +456,6 @@ mod tests {
         assert!(s.contains("Upgrade both"), "{s}");
     }
 
-    /// The server must tolerate the slowest heartbeat the client can settle into, or an idle
-    /// laptop would be disconnected on a timer rather than because anything was wrong.
     #[test]
     fn the_timers_are_ordered_so_no_side_gives_up_first_by_accident() {
         assert!(POLL < PING_INTERVAL);
@@ -529,10 +490,8 @@ mod tests {
             assert_eq!(hb.tick(at(t0, 1)), Beat::Ping);
         }
 
-        /// The whole point of the ping being on its own timer: with a steady listener set neither
-        /// side has anything to say, and an implementation that only pinged after a read would
-        /// have both sides block until the liveness timeout, killing the connection every few
-        /// seconds forever.
+        /// An implementation that pinged only after a read deadlocks two idle peers and kills the
+        /// connection every few seconds, forever.
         #[test]
         fn pings_continue_while_nothing_is_received() {
             let t0 = Instant::now();
@@ -570,8 +529,6 @@ mod tests {
             assert_eq!(hb.tick(at(t0, 5)), Beat::Expired);
         }
 
-        /// Going idle must not expire a connection that was healthy a moment earlier: the deadline
-        /// is measured against the interval in force *now*, so relaxing the interval relaxes it.
         #[test]
         fn slowing_down_does_not_retroactively_expire_a_healthy_connection() {
             let t0 = Instant::now();
@@ -588,8 +545,6 @@ mod tests {
             assert_eq!(hb.tick(at(t0, 93)), Beat::Expired);
         }
 
-        /// The reverse: speeding up shortens the deadline, which is what makes a stale enabled
-        /// flag cheap to notice exactly when something is riding the tunnel.
         #[test]
         fn speeding_up_shortens_the_deadline_immediately() {
             let t0 = Instant::now();

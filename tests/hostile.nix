@@ -8,8 +8,7 @@
   s = import ./lib/scenarios.nix {inherit pkgs;};
   common = s.node {inherit kernelPackages needlecast;};
 in
-  # The regression suite. Everything here is a way the system could be wrong without any of the
-  # happy-path tests noticing.
+  # Every case here is a way the system could be wrong without a happy-path test noticing.
   testers.runNixOSTest {
     name = "needlecast-hostile-${variant}";
 
@@ -19,9 +18,8 @@ in
     testScript = ''
       ${s.preamble}
       PORT = 8080
-      # A second server that holds connections open, for the cases that need an established socket
-      # to still exist when they look. Kept off PORT so it cannot starve the churn and concurrency
-      # cases of threads.
+      # Holds connections open, for cases needing an established socket to still be there when
+      # they look. Off PORT so it cannot starve the churn and concurrency cases of threads.
       HOLD_PORT = 8090
       OUT_OF_RANGE = 9500
 
@@ -64,8 +62,7 @@ in
           assert local(client, HOLD_PORT).get("data") == "client-local"
 
       with subtest("bind never blocked: the bridge holds no forwarded port"):
-          # It just succeeded above while the bridge was serving that port, but assert the
-          # mechanism directly too.
+          # It just succeeded above, but assert the mechanism directly too.
           rc, _ = client.execute(
               f"python3 -c \"import socket;s=socket.socket();"
               f"s.setsockopt(1,2,1);s.bind(('127.0.0.1',{PORT + 1}));s.listen(1)\""
@@ -138,9 +135,8 @@ in
           assert delta(before, "connect4.not_loopback") >= 1, counters(client, "counters")
 
       with subtest("the control connection is never itself rewritten"):
-          # Hold a forwarded connection open first: the heartbeat only runs once a second while
-          # something is riding the tunnel, and otherwise this would have to wait half a minute
-          # for a single packet to observe.
+          # The heartbeat only runs once a second while something is riding the tunnel; otherwise
+          # this waits half a minute for a single packet.
           client.succeed("rm -f /tmp/beat.out")
           client.succeed(
               f"setsid nc-probe connect --host 127.0.0.1 --port {HOLD_PORT} --hold 30 "
@@ -152,9 +148,8 @@ in
           before_tc = {k: int(v) for k, v in parse(
               server.succeed("needlecast dev tc-counters || true")).items()}
           client.succeed("sleep 6")
-          # It runs over the tunnel address, so connect4 declines it as non-loopback. On the
-          # server its port is outside the managed range, so tc skips it. Both must hold, or the
-          # control plane would be forwarding itself.
+          # connect4 declines it as non-loopback; tc skips it as out of range. Both must hold, or
+          # the control plane forwards itself.
           assert delta(before, "connect4.rewritten") == 0
           after_tc = {k: int(v) for k, v in parse(
               server.succeed("needlecast dev tc-counters || true")).items()}
@@ -183,7 +178,7 @@ in
           )
           client.wait_until_succeeds("grep -q '^data=' /tmp/idle.out", timeout=20)
           client.succeed("sleep 40")
-          # There is deliberately no per-connection state anywhere, so nothing can expire it.
+          # There is no per-connection state anywhere, so nothing can expire it.
           est = client.succeed(f"ss -tn state established | grep ':{HOLD_PORT}' || true")
           assert SERVER_ADDR in est, est
 
@@ -224,7 +219,7 @@ in
               "journalctl -u http --no-pager | grep -c 'GET / HTTP' || true").strip()
           print(f"http requests served: {served}")
           assert int(served) >= 1, "the server's http server saw no request"
-          # A real client, resolving `localhost` itself, with an untouched Host header.
+          # A real client resolving `localhost` itself.
           client.succeed("curl -sf -o /dev/null -H 'Host: localhost:8085' http://localhost:8085/")
 
       with subtest("final counters"):

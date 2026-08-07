@@ -1,9 +1,7 @@
-//! `tc_egress`: put the reply back on the wire with the right source.
+//! Put the reply back on the wire with the right source.
 //!
-//! The server answered from `127.0.0.1`, which is meaningless to the laptop, so the source is
-//! rewritten back to the desktop's tunnel address. This is the exact inverse of `tc_ingress` and
-//! needs no state to pair them: ports are never translated, so the port pair already identifies the
-//! flow.
+//! The exact inverse of `tc_ingress`, needing no state to pair them: ports are never translated, so
+//! the port pair already identifies the flow.
 
 use aya_ebpf::{macros::classifier, programs::TcContext};
 use needlecast_common::{net, tc, tcev, SleeveConfig};
@@ -21,7 +19,6 @@ fn egress(ctx: &mut TcContext, cfg: &SleeveConfig, l3: usize) -> i32 {
         tc_bump(prog, tcev::WRONG_ADDR);
         return OK;
     }
-    // The source port here is the one the client addressed on the way in.
     if !port_in_range(ctx, prog, &p, cfg, net::L4_SPORT_OFF) {
         return OK;
     }

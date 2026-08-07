@@ -3,8 +3,7 @@
   rustPlatform,
   cargo-nextest,
   needlecast-ebpf,
-  # Compiles the affordances the VM suites need to isolate one half of the system. Off for anything
-  # that ships, so no feature-gated path can become load bearing for the real thing.
+  # The affordances the VM suites need to isolate one half. Off for anything that ships.
   testing ? false,
 }:
 rustPlatform.buildRustPackage {
@@ -20,9 +19,8 @@ rustPlatform.buildRustPackage {
 
   buildFeatures = lib.optional testing "testing";
 
-  # The default nextest profile in .config/nextest.toml excludes the `vm` binary, which shells out
-  # to `nix build` and cannot run inside a sandbox. Everything else runs here, so a broken predicate
-  # fails the package build rather than waiting for someone to run the tests by hand.
+  # The default nextest profile excludes the `vm` binary, which shells out to `nix build`.
+  # Everything else runs here, so a broken predicate fails the package build.
   useNextest = true;
   nativeCheckInputs = [cargo-nextest];
 

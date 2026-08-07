@@ -1,9 +1,8 @@
-//! `needlecast client` — the machine that types `localhost:8080` and means the other one.
+//! The machine that types `localhost:8080` and means the other one.
 //!
-//! The state machine is small, and one thing in it is load bearing: **on any error the enabled flag
-//! is cleared before anything else**. There must never be a window where the programs rewrite
-//! toward a server known to be gone, because that converts an instant, correct `ECONNREFUSED` into
-//! a hang.
+//! One thing here is load bearing: **on any error the enabled flag is cleared before anything
+//! else**. A window where the programs rewrite toward a server known to be gone converts an
+//! instant, correct `ECONNREFUSED` into a hang.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
@@ -24,8 +23,6 @@ use crate::wake;
 const BACKOFF_MIN: Duration = Duration::from_millis(200);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-/// How often to re-resolve the peer's name while connected. WireGuard resolves an endpoint once
-/// and holds it forever, so a peer that moves is unreachable until something notices.
 const ENDPOINT_REFRESH: Duration = Duration::from_secs(300);
 
 pub struct Args {
@@ -49,8 +46,7 @@ pub fn run(a: Args) -> Result<()> {
     let mut backoff = BACKOFF_MIN;
     let mut watch = wake::Watch::new();
     while !shutdown.requested() {
-        // Re-resolve before every attempt while disconnected: the peer moving is one of the two
-        // reasons a reconnect would otherwise never succeed.
+        // A moved peer is one of the two reasons a reconnect would otherwise never succeed.
         if let Err(e) = tunnel.refresh_endpoint() {
             log::debug!("could not re-resolve {endpoint}: {e:#}");
         }
@@ -74,8 +70,7 @@ pub fn run(a: Args) -> Result<()> {
 
         shutdown.sleep(backoff);
         backoff = (backoff * 2).min(BACKOFF_MAX);
-        // A local change makes waiting pointless: the old connection is dead even though the
-        // socket does not know it yet.
+        // The old connection is already dead, even though the socket does not know it yet.
         if let Some(reason) = watch.poll() {
             log::info!("{}, reconnecting now", reason.as_str());
             backoff = BACKOFF_MIN;
@@ -93,8 +88,6 @@ enum Ended {
     Shutdown,
 }
 
-/// One connection's lifetime: handshake, adopt the server's range, mirror its listener set, and
-/// heartbeat until something goes wrong.
 fn session(
     tunnel: &mut Tunnel,
     addr: SocketAddr,
@@ -107,15 +100,14 @@ fn session(
         s.port_lo,
         s.port_hi
     );
-    // The server is authoritative over what it exposes, so the range comes from it rather than
-    // from a flag on this side that could disagree.
+    // The server is authoritative over what it exposes.
     bpf::set_port_range(s.port_lo, s.port_hi)?;
 
     let mut stream = s.stream;
     let mut reader = stream.try_clone()?;
 
-    // Deliberately not enabled yet: wait for the first listener snapshot, so the very first
-    // connection after coming up is decided on real information rather than an empty map.
+    // Not enabled until the first listener snapshot, so the first connection after coming up is
+    // decided on real information rather than an empty map.
     let mut ready = false;
     let mut heartbeat = control::Heartbeat::new(Instant::now());
     let mut last_probe = Instant::now();
@@ -148,9 +140,7 @@ fn session(
             Err(e) => return Err(e.into()),
         }
 
-        // Fast while something is riding the tunnel, because that is when a stale flag costs
-        // something; slow when nothing is, because then it costs only battery. Re-checked at most
-        // once per second, since it reads `/proc/net/tcp`.
+        // Re-checked at most once per second, since it reads `/proc/net/tcp`.
         if last_probe.elapsed() >= control::PING_INTERVAL {
             last_probe = Instant::now();
             let was = heartbeat.interval();
@@ -160,8 +150,7 @@ fn session(
             }
         }
 
-        // On its own timer, not gated on having received something — otherwise two idle peers
-        // deadlock and every connection dies at the liveness timeout.
+        // On its own timer: gating it on having received something deadlocks two idle peers.
         match heartbeat.tick(Instant::now()) {
             control::Beat::Ping => wire::write(&mut stream, &Msg::Ping)?,
             control::Beat::Expired => {
@@ -181,20 +170,15 @@ fn session(
     }
 }
 
-/// Holds the cgroup links. Dropping it, or dying, detaches every program and the machine reverts
-/// to stock — which is why a crashed daemon is safe rather than merely unlucky.
+/// Dropping it, or dying, detaches every program and the machine reverts to stock.
 pub struct Bridge {
     _ebpf: aya::Ebpf,
     _cgroup: std::fs::File,
 }
 
 impl Bridge {
-    /// Clearing the flag first is the ordering that matters: there must never be a window where
-    /// the programs rewrite toward a server known to be gone. The listener map is merely stale
-    /// after that, and a stale set is still worse than none.
-    ///
-    /// Takes `&self` so it cannot be called on a bridge that has already been detached — at which
-    /// point the maps are gone and there would be nothing to clear.
+    /// The flag first, always. Takes `&self` so it cannot be called on an already-detached bridge,
+    /// where the maps are gone and there would be nothing to clear.
     pub fn disable(&self) {
         if let Err(e) = bpf::set_enabled(0).and_then(|()| bpf::clear_listeners()) {
             log::error!("failed to disable the bridge: {e:#}");
@@ -202,27 +186,22 @@ impl Bridge {
     }
 }
 
-/// How the cgroup programs are configured at attach time.
 pub struct Attach {
     pub target_v4: Ipv4Addr,
-    /// `None` on the shipped client: the tunnel is IPv4-only, and `connect6` declines a native v6
-    /// destination rather than rewriting it to the unspecified address.
+    /// `None` on the shipped client, where `connect6` then declines rather than rewriting to `::`.
     pub target_v6: Option<Ipv6Addr>,
     pub syncnt: u8,
     pub port_lo: u16,
     pub port_hi: u16,
     pub netns_guard: bool,
     pub enabled: bool,
-    /// Also attach the isolated `bpf_setsockopt(TCP_SYNCNT)` probe. Only the harness asks for it:
-    /// a verifier rejection there is an observable result rather than something that takes the
-    /// other eight programs down with it.
+    /// Harness only. Kept separate so a verifier rejection is an observable result rather than
+    /// something that takes the other eight programs down with it.
     pub syncnt_probe: bool,
 }
 
 impl Attach {
-    /// What the programs will read. Split out from the attach so the shape of it is testable
-    /// without a kernel — and the shape is what decides whether the machine behaves as if
-    /// needlecast were not installed.
+    /// Split out from the attach so its shape is testable without a kernel.
     fn config(&self, netns_cookie: u64) -> Config {
         Config {
             netns_cookie,
@@ -240,8 +219,8 @@ impl Attach {
 }
 
 impl Bridge {
-    /// `enabled` starts at 0 and the range starts empty, so before the control connection is up
-    /// `localhost:8080` behaves exactly as if needlecast were not installed.
+    /// Starts disabled with an empty range, so before the control connection is up the machine
+    /// behaves exactly as if needlecast were not installed.
     pub fn attach(target_v4: Ipv4Addr, syncnt: u8) -> Result<Self> {
         Self::attach_with(Attach {
             target_v4,
@@ -328,9 +307,6 @@ mod tests {
         }
     }
 
-    /// Before the control connection is up, `localhost:8080` must behave exactly as if needlecast
-    /// were not installed: an instant, correct `ECONNREFUSED` rather than a hang. Two things
-    /// guarantee that, and both are set at attach time.
     #[test]
     fn the_bridge_starts_inert() {
         let c = shipped().config(1234);
@@ -345,15 +321,12 @@ mod tests {
         );
     }
 
-    /// The client never configures its own range: it adopts whatever the server says it serves.
     #[test]
     fn the_range_arrives_from_the_server_rather_than_from_attach() {
         let c = shipped().config(1);
         assert_eq!((c.port_lo, c.port_hi), (0, 0));
     }
 
-    /// All-zero means "decline IPv6", not "rewrite to `::`". Getting this wrong would send v6
-    /// connections to the unspecified address while looking like it worked.
     #[test]
     fn no_v6_target_is_encoded_as_all_zero_words() {
         assert_eq!(shipped().config(1).target_v6, [0; 4]);
@@ -371,16 +344,12 @@ mod tests {
         assert!(!net::is_loopback_v4(c.target_v4));
     }
 
-    /// Dropping the guard is a harness-only affordance, and it is encoded as a zero cookie because
-    /// that is what the program treats as "do not compare".
     #[test]
     fn the_netns_guard_is_the_captured_cookie() {
         assert_eq!(shipped().config(9876).netns_cookie, 9876);
         assert_eq!(shipped().config(0).netns_cookie, 0);
     }
 
-    /// The listener feed is always consulted on the shipped client — it is a latency optimisation,
-    /// but leaving it off would mean forwarding to ports the server does not serve.
     #[test]
     fn the_listener_map_is_always_consulted() {
         assert_eq!(shipped().config(1).use_listener_map, 1);
@@ -396,8 +365,6 @@ mod tests {
         assert_eq!(b, BACKOFF_MAX, "backoff must converge, not grow forever");
     }
 
-    /// Re-resolving every five minutes while connected is what follows a peer that moves without
-    /// making a DNS request per heartbeat.
     #[test]
     fn the_endpoint_refresh_is_slower_than_the_heartbeat_but_not_indefinite() {
         assert!(ENDPOINT_REFRESH > control::IDLE_PING_INTERVAL);

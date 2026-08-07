@@ -8,9 +8,8 @@
   s = import ./lib/scenarios.nix {inherit pkgs;};
   common = s.node {inherit kernelPackages needlecast;};
 in
-  # The laptop is offline most of the time and the desktop is not always up either. Both sides must
-  # degrade to "as if needlecast were not installed" and recover without intervention. These are
-  # the cases the happy-path suites cannot reach because they need something to actually break.
+  # Both sides must degrade to "as if needlecast were not installed" and recover unattended. These
+  # cases need something to actually break, so the happy-path suites cannot reach them.
   testers.runNixOSTest {
     name = "needlecast-resilience-${variant}";
 
@@ -50,8 +49,7 @@ in
           client.wait_until_succeeds("grep -q '^data=' /tmp/flow.out", timeout=20)
 
           server.succeed("systemctl stop ncserver.service")
-          # The client notices and disables rather than continuing to rewrite toward a server it
-          # knows is gone — the ordering the whole control plane exists to guarantee.
+          # Disabling rather than continuing to rewrite is what the control plane exists for.
           client.wait_until_succeeds(
               "needlecast dev show-config | grep -q 'enabled=0'", timeout=60
           )
@@ -67,7 +65,7 @@ in
           client.wait_until_fails("systemctl is-active ncclient.service", timeout=30)
           client.succeed(f"ip link show {IFACE}")
           assert state(client) == "not-running", state(client)
-          # Behaviour is stock in the meantime: the bpf_links dropped with the process.
+          # Stock in the meantime: the bpf_links dropped with the process.
           r = local(client, PORT, "--timeout 10")
           assert r.get("error") == "ECONNREFUSED", r
 
@@ -85,14 +83,12 @@ in
           wait_enabled(client)
           assert local(client, PORT).get("data") == "server-side"
 
-      # WireGuard resolves an endpoint once and then holds that address forever; if the peer moves,
-      # the tunnel is dead until something updates it. That something is needlecast, and this is
-      # the only test that exercises it.
+      # WireGuard holds a resolved endpoint forever, so a moved peer is unreachable until
+      # needlecast re-resolves. The only test that exercises it.
       with subtest("the client re-resolves a peer whose address changed"):
           real = server.succeed("ip -4 -o addr show eth1 | awk '{print $4}'").split("/")[0].strip()
           print(f"the server is really at {real}")
 
-          # Point the name somewhere dead, and stop the server so the client must reconnect.
           # `/etc/hosts` is a store symlink, so the swap is a bind mount over it.
           client.succeed(
               "cp /etc/hosts /tmp/hosts.bad && "
@@ -102,8 +98,7 @@ in
           )
           # The name cache would otherwise answer from before the swap.
           client.succeed("systemctl restart nscd.service || true")
-          # `ahostsv4`, because the test framework also publishes an AAAA for each machine and
-          # needlecast deliberately prefers the A record.
+          # `ahostsv4`: the framework also publishes an AAAA, and needlecast prefers the A.
           client.wait_until_succeeds(
               "getent ahostsv4 server | grep -q 192.0.2.9", timeout=60
           )
@@ -112,8 +107,8 @@ in
               "needlecast dev show-config | grep -q 'enabled=0'", timeout=60
           )
           start_server(server, peer="client")
-          # It cannot come back while the name resolves to nowhere, which is what makes the
-          # recovery below attributable to re-resolution rather than to simple retrying.
+          # It cannot come back while the name resolves nowhere, which is what makes the recovery
+          # below attributable to re-resolution rather than retrying.
           client.succeed("sleep 10")
           assert parse(client.succeed("needlecast dev show-config")).get("enabled") == "0"
 
@@ -126,8 +121,7 @@ in
           assert real in ep, ep
           assert local(client, PORT).get("data") == "server-side"
 
-      # A suspended laptop would otherwise leave a server thread blocked on a socket that will
-      # never speak again, reaped only by TCP keepalive — which defaults to two hours.
+      # Otherwise a suspended laptop holds a thread until TCP keepalive notices, in two hours.
       with subtest("the server reaps a client that stopped speaking"):
           before = int(server.succeed(
               "ss -tn state established | grep -c ':47653' || true").strip())
@@ -135,7 +129,7 @@ in
           assert before >= 1
 
           client.succeed("systemctl kill -s SIGSTOP ncclient.service")
-          # The timeout is a generous multiple of the slowest heartbeat, so this is minutes.
+          # A generous multiple of the slowest heartbeat, so this takes minutes.
           server.wait_until_succeeds(
               "test \"$(ss -tn state established | grep -c ':47653' || true)\" = 0", timeout=240
           )
@@ -149,7 +143,7 @@ in
               m.succeed(f"systemctl stop {unit}.service")
               m.wait_until_fails(f"ip link show {IFACE}", timeout=30)
               m.fail(f"test -e /proc/sys/net/ipv4/conf/{IFACE}/route_localnet")
-          # And the machine behaves exactly as if needlecast were not installed.
+          # And behaves exactly as if needlecast were not installed.
           r = local(client, PORT, "--timeout 10")
           assert r.get("error") == "ECONNREFUSED", r
           assert client.succeed("bpftool prog show | grep -c cgroup_sock_addr || true").strip() == "0"

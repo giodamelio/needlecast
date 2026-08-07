@@ -1,9 +1,8 @@
-//! `sendmsg4` and `sendmsg6`: the same decision for UDP sockets that never called `connect()`.
+//! The same decision for UDP sockets that never called `connect()`.
 //!
-//! An unconnected socket has no stored destination, so this fires per datagram and re-decides every
-//! time. That is a real behavioural difference from TCP — a local listener appearing mid-flow
-//! silently redirects the next datagram — and it is deliberate: for a connectionless protocol,
-//! "whoever holds the port now" is the right answer.
+//! No stored destination means this re-decides per datagram, so a local listener appearing mid-flow
+//! redirects the next one. Deliberate: for a connectionless protocol, "whoever holds the port now"
+//! is the right answer.
 
 use aya_ebpf::{macros::cgroup_sock_addr, programs::SockAddrContext};
 use needlecast_common::prog;

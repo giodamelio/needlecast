@@ -1,14 +1,11 @@
-//! Two signals that make waiting pointless, so the client can reconnect promptly rather than
-//! eventually.
-//!
-//! Backoff is the right default when a peer is merely down. It is the wrong answer when the *local*
-//! machine just changed underneath the connection: the socket does not know it is dead yet, and
-//! sleeping out the backoff wastes the exact moment the user is waiting on.
+//! Backoff is right when the peer is merely down, and wrong when the *local* machine just changed
+//! underneath the connection — the socket does not know it is dead yet, and sleeping out the
+//! backoff wastes the exact moment someone is waiting on.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-/// What woke us. Only used for a log line, but a specific one beats "retrying".
+/// Only used for a log line, but a specific one beats "retrying".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     Resumed,
@@ -39,16 +36,15 @@ impl Watch {
         }
     }
 
-    /// Anything worth abandoning the backoff for. Cheap enough to call on every loop tick.
+    /// Cheap enough to call on every loop tick.
     pub fn poll(&mut self) -> Option<Reason> {
         // CLOCK_MONOTONIC stops while suspended and CLOCK_BOOTTIME does not, so the gap between
-        // them *is* time spent suspended. A jump in it detects resume with no systemd integration
-        // and no new dependency.
+        // them *is* time spent suspended — resume detection with no systemd integration.
         let suspended = suspended_time();
         if suspended.saturating_sub(self.suspended) >= RESUME_THRESHOLD {
             self.suspended = suspended;
-            // Coming back from suspend almost always renumbers, so refresh both baselines rather
-            // than reporting a network change on the next tick as well.
+            // Resuming almost always renumbers, so refresh both baselines rather than reporting a
+            // network change on the next tick too.
             self.addresses = local_addresses();
             self.routes = route_fingerprint();
             return Some(Reason::Resumed);
@@ -72,7 +68,7 @@ impl Default for Watch {
     }
 }
 
-/// Below this, the difference is scheduling noise rather than a suspend.
+/// Below this it is scheduling noise rather than a suspend.
 const RESUME_THRESHOLD: Duration = Duration::from_secs(2);
 
 fn clock(id: libc::clockid_t) -> Duration {
@@ -80,7 +76,7 @@ fn clock(id: libc::clockid_t) -> Duration {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    // Cannot fail for these two clock ids on any kernel that runs eBPF.
+    // Cannot fail for these clock ids on any kernel that runs eBPF.
     unsafe { libc::clock_gettime(id, &mut ts) };
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
@@ -89,8 +85,7 @@ fn suspended_time() -> Duration {
     clock(libc::CLOCK_BOOTTIME).saturating_sub(clock(libc::CLOCK_MONOTONIC))
 }
 
-/// Every address on every interface, as `iface/address`. `needle` is excluded: needlecast changes
-/// that one itself, and a change we made is not news.
+/// `needle` and `lo` are excluded: a change we made ourselves is not news.
 fn local_addresses() -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     unsafe {
@@ -133,8 +128,8 @@ unsafe fn sockaddr_text(sa: *const libc::sockaddr) -> Option<String> {
     }
 }
 
-/// A change of default route is the clearest "you are on a different network now" signal there is,
-/// and `/proc/net/route` shows it without a netlink socket.
+/// A changed default route is the clearest "different network now" signal, and `/proc/net/route`
+/// shows it without a netlink socket.
 fn route_fingerprint() -> u64 {
     let Ok(text) = std::fs::read_to_string("/proc/net/route") else {
         return 0;
@@ -162,10 +157,9 @@ fn fingerprint_routes(text: &str) -> u64 {
 mod tests {
     use super::*;
 
+    /// Otherwise `saturating_sub` reports zero forever and resume detection silently stops.
     #[test]
     fn boottime_is_never_behind_monotonic() {
-        // If it were, `saturating_sub` would report zero suspended time forever and resume
-        // detection would silently stop working.
         assert!(clock(libc::CLOCK_BOOTTIME) >= clock(libc::CLOCK_MONOTONIC));
     }
 
@@ -196,7 +190,6 @@ mod tests {
         assert_eq!(fingerprint_routes(&wifi), fingerprint_routes(&wifi.clone()));
     }
 
-    /// needlecast changes `needle`'s own routes, and a change we made is not news.
     #[test]
     fn our_own_interface_is_excluded_from_the_route_fingerprint() {
         let header = "Iface\tDestination\tGateway\tFlags\n";

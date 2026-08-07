@@ -1,12 +1,8 @@
-//! `needlecast status` — what this machine is doing, read straight from the kernel.
+//! **No IPC dependency on the daemon**, because the moment this is worth having is the moment the
+//! daemon is wedged or dead.
 //!
-//! Deliberately takes **no IPC dependency on the daemon**, because the moment it is worth having is
-//! exactly the moment the daemon is wedged or dead. Everything below comes from WireGuard over
-//! netlink, the pinned BPF maps, `/proc/net/tcp`, and the loaded-program table.
-//!
-//! The map pins are not evidence of a running daemon: they appear during load and survive a crashed
-//! process. Liveness comes from whether the programs are still loaded, because those disappear with
-//! the process that holds their links.
+//! Liveness comes from whether the programs are still *loaded*. The map pins are not evidence of
+//! anything: they appear during load and survive a crash.
 
 use std::time::SystemTime;
 
@@ -22,16 +18,12 @@ use crate::control;
 use crate::transport;
 use crate::StatusRole;
 
-/// The four states DESIGN.md distinguishes, in the order they occur.
+/// In the order they occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    /// No interface and no pinned maps: needlecast has not run here.
     NeverStarted,
-    /// State on disk but no loaded programs: it ran and is not running now.
     NotRunning,
-    /// Running, but the control connection is down, so nothing is being rewritten.
     Disconnected,
-    /// Running with the bridge enabled.
     Connected,
 }
 
@@ -46,8 +38,7 @@ impl State {
     }
 }
 
-/// Decides the state from three independent observations, so that no single stale artefact can
-/// produce a wrong answer on its own.
+/// Three independent observations, so no single stale artefact can produce a wrong answer alone.
 pub fn classify(has_state: bool, programs_loaded: bool, enabled: Option<u8>) -> State {
     match (has_state, programs_loaded, enabled) {
         (false, false, _) => State::NeverStarted,
@@ -57,9 +48,8 @@ pub fn classify(has_state: bool, programs_loaded: bool, enabled: Option<u8>) -> 
     }
 }
 
-/// Which halves to report on. `Auto` shows whichever left state behind, so a machine that only ever
-/// ran one does not get a section about the other; naming a role shows it regardless, because
-/// "nothing here" is the answer you asked for.
+/// `Auto` reports whichever half left state behind; naming a role reports it regardless, because
+/// "nothing here" is then the answer you asked for.
 fn which(role: StatusRole, client_state: bool, server_state: bool) -> (bool, bool) {
     match role {
         StatusRole::Auto => (client_state, server_state),
@@ -225,8 +215,7 @@ fn report_tunnel() {
     }
 }
 
-/// Seconds since the last handshake, or `never`. A tunnel that has never handshaken and one that
-/// handshook an hour ago are different problems.
+/// A tunnel that never handshook and one that handshook an hour ago are different problems.
 fn handshake_age(last: Option<SystemTime>) -> String {
     match last {
         None => "never".to_string(),
@@ -238,8 +227,7 @@ fn handshake_age(last: Option<SystemTime>) -> String {
     }
 }
 
-/// The programs disappear with the process holding their links, so this — not the presence of a
-/// pin, which survives a crash — is what distinguishes a running daemon from a dead one.
+/// The programs disappear with the process holding their links; the pins do not.
 fn any_program_loaded(names: &[&str]) -> bool {
     aya::programs::loaded_programs()
         .filter_map(|p| p.ok())
@@ -299,8 +287,7 @@ mod tests {
         assert_eq!(classify(false, false, None), State::NeverStarted);
     }
 
-    /// The distinction that matters: map pins survive a crashed process, so state on disk with no
-    /// loaded programs is "it died", not "it is running but idle".
+    /// Map pins survive a crash, so state on disk with no loaded programs means "it died".
     #[test]
     fn state_on_disk_without_loaded_programs_is_not_running() {
         assert_eq!(classify(true, false, None), State::NotRunning);
@@ -344,21 +331,17 @@ mod tests {
             assert_eq!(which(StatusRole::Auto, false, false), (false, false));
         }
 
-        /// Both halves on one machine would fight over `needle`, but `status` still reports what
-        /// it finds rather than deciding the situation is impossible.
         #[test]
         fn auto_reports_both_when_both_left_state_behind() {
             assert_eq!(which(StatusRole::Auto, true, true), (true, true));
         }
 
-        /// Naming a role reports it even with nothing on disk: "never started" is the answer.
         #[test]
         fn a_named_role_is_reported_regardless() {
             assert_eq!(which(StatusRole::Client, false, false), (true, false));
             assert_eq!(which(StatusRole::Server, false, false), (false, true));
         }
 
-        /// And naming one role never drags in the other.
         #[test]
         fn a_named_role_excludes_the_other() {
             assert_eq!(which(StatusRole::Client, true, true), (true, false));

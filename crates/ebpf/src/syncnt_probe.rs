@@ -1,11 +1,8 @@
-//! `connect4_syncnt_probe`: a capability probe, not part of the datapath.
+//! A capability probe, not part of the datapath.
 //!
-//! Whether `bpf_setsockopt(TCP_SYNCNT)` is permitted in `cgroup_sock_addr` is a verifier question,
-//! and a rejection takes down whatever object it is part of. Keeping it as its own program means a
-//! rejection is an observable result — the loader reports it and carries on — rather than something
-//! that stops the other ten programs from loading.
-//!
-//! Worth keeping this shape for any future capability probe.
+//! A verifier rejection takes down whatever object it is part of, so keeping this separate makes
+//! one an observable result rather than something that stops the other ten programs loading.
+//! Worth the same shape for any future probe.
 
 use aya_ebpf::{macros::cgroup_sock_addr, programs::SockAddrContext, EbpfContext};
 use needlecast_common::{ev, prog};

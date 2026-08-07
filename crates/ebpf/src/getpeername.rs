@@ -1,8 +1,7 @@
-//! `getpeername4` and `getpeername6`: tell the client what it asked for.
+//! Tell the client what it asked for.
 //!
-//! Without this a program that connects to `127.0.0.1:8080` and then calls `getpeername()` learns
-//! the desktop's tunnel address, which is exactly the leak the design exists to prevent. Anything
-//! that logs its peer, or checks it, would see through the whole arrangement.
+//! Without this, anything that logs or checks its peer learns the server's tunnel address — which
+//! is exactly the leak the design exists to prevent.
 
 use aya_ebpf::{macros::cgroup_sock_addr, programs::SockAddrContext};
 use needlecast_common::prog;

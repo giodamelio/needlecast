@@ -1,53 +1,38 @@
-//! The control connection between the laptop and the desktop.
-//!
-//! It runs as plain TCP over the tunnel. WireGuard authenticates it, and the peer's identity *is*
-//! its tunnel source address, so there is no TLS, no certificate, and no token here.
-//!
-//! It carries exactly three things: whether the server is alive, one-shot negotiation, and the
-//! set of ports the server is serving.
+//! Whether the peer is alive, one-shot negotiation, and the set of ports the server is serving.
 
 use serde::{Deserialize, Serialize};
 
-/// Bumped whenever anything below changes shape. A mismatch is **fatal on both sides** — no
-/// negotiation, no compatibility shim, no silently-degraded mode — because postcard is
-/// non-self-describing and a field added on one side would otherwise be misread rather than
-/// rejected. Upgrading means upgrading both, which for two machines you control is the honest
-/// constraint anyway.
+/// A mismatch is **fatal on both sides**: postcard is non-self-describing, so a field added on one
+/// side would be misread rather than rejected.
 ///
-/// The version itself is exchanged in a fixed eight-byte preamble ahead of any postcard frame, so
-/// two incompatible builds can still diagnose each other. See `control::exchange_version`.
+/// Exchanged in a fixed eight-byte preamble ahead of any postcard frame, so two incompatible builds
+/// can still diagnose each other.
 pub const VERSION: u32 = 1;
 
-/// The server's control port. Fixed, because the client has to know where to dial; the client side
-/// binds nothing, so it needs no such number.
+/// Fixed, because the client has to know where to dial. The client binds nothing.
 pub const DEFAULT_CONTROL_PORT: u16 = 47653;
 
-/// Exit status for a version mismatch. `EX_CONFIG` from sysexits, chosen so a supervisor can name
-/// it in `RestartPreventExitStatus=` and make the failure loud and *stationary* rather than a
-/// crash loop.
+/// `EX_CONFIG`, so a supervisor can name it in `RestartPreventExitStatus=` and make the failure
+/// stationary rather than a crash loop.
 pub const EXIT_VERSION_MISMATCH: i32 = 78;
 
-/// The eight-byte handshake preamble's magic, which must stay byte-identical forever so that two
-/// builds speaking different schemas can still diagnose each other.
+/// Must stay byte-identical forever, or a future build cannot diagnose an older one.
 pub const MAGIC: [u8; 4] = *b"NDLC";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Msg {
-    /// The server's first frame. Carries the managed range, which the server is authoritative
-    /// over — the client adopts it rather than configuring its own.
+    /// Carries the managed range, which the client adopts rather than configuring its own.
     Welcome {
         port_lo: u16,
         port_hi: u16,
     },
     Ping,
     Pong,
-    /// The complete set the server is serving. Sent once after `Welcome` and again whenever it
-    /// changes, so a lost delta cannot leave the two sides disagreeing indefinitely.
+    /// The complete set, not a delta, so a lost update cannot leave the two sides disagreeing.
     Listeners {
         ports: alloc::vec::Vec<u16>,
     },
-    /// Sent before a clean shutdown so the peer can act immediately rather than waiting for the
-    /// heartbeat to time out.
+    /// So the peer acts immediately rather than waiting for the heartbeat to time out.
     Goodbye,
 }
 
@@ -114,8 +99,6 @@ mod tests {
         assert!(wire::read(&mut buf.as_slice()).is_err());
     }
 
-    /// Postcard is non-self-describing, so this is not a hypothetical: bytes meant as one variant
-    /// decode as another rather than failing. It is why the version preamble exists.
     #[test]
     fn a_listener_set_survives_the_managed_range_width() {
         let ports: std::vec::Vec<u16> = (8000..=8999).collect();
@@ -128,8 +111,7 @@ mod tests {
     }
 }
 
-/// Length-delimited postcard. The message rate is about one per second, so this is a type-safety
-/// decision rather than a performance one.
+/// Length-delimited postcard. About one message per second, so this is a type-safety decision.
 pub mod wire {
     use super::Msg;
     use std::io::{self, Read, Write};

@@ -1,35 +1,27 @@
-//! Reading and rewriting IPv4 packets from a tc context.
+//! Reading and rewriting IPv4 packets from a tc context. Two hazards a straightforward
+//! implementation gets wrong:
 //!
-//! Two hazards are handled here that a straightforward implementation gets wrong:
+//! **The L2 boundary.** WireGuard is `ARPHRD_NONE` with no link header; Ethernet has fourteen
+//! bytes before the IP header. The loader reads the device type and puts the offset in
+//! `SleeveConfig`, so one program serves both.
 //!
-//! **The L2 boundary.** A WireGuard interface is `ARPHRD_NONE` and carries no link header at all,
-//! while an Ethernet link carries fourteen bytes before the IP header. Rather than two code paths,
-//! the loader reads `/sys/class/net/<iface>/type` and puts the offset in `SleeveConfig`, so one
-//! program serves both device classes.
-//!
-//! **Fragments.** tc ingress runs before IP reassembly, so a UDP datagram larger than the path MTU
-//! arrives as several fragments, each hitting this program separately, and only the first carries
-//! an L4 header. Later fragments therefore have no port to range-check and no L4 checksum to fix —
-//! they are admitted on the address alone, which is sound because the address is what identifies
-//! the flow here.
+//! **Fragments.** Only the first carries an L4 header, so later ones have no port to check and no
+//! L4 checksum to fix. They are admitted on the address alone, which identifies the flow here.
 
 use aya_ebpf::{bindings::TC_ACT_OK, programs::TcContext};
 use needlecast_common::{net, tcev, SleeveConfig};
 
 use crate::maps::{tc_bump, SLEEVE_CONFIG};
 
-/// A classifier returns `i32`; the binding is already one on this target.
 pub const OK: i32 = TC_ACT_OK;
 
-/// Recompute over a four-byte address change. The L4 checksum covers a pseudo-header containing
-/// the addresses, so it changes even though nothing in the L4 header did.
+/// The L4 checksum covers a pseudo-header containing the addresses, so it changes even though
+/// nothing in the L4 header did.
 const CSUM_FIELD_LEN: u64 = 4;
 const BPF_F_PSEUDO_HDR: u64 = 1 << 4;
-/// A zero IPv4 UDP checksum means "not computed" and must stay zero. Without this flag the fixup
-/// would turn it into a real value and the receiver would drop the datagram.
+/// A zero IPv4 UDP checksum means "not computed" and must stay zero, or the receiver drops it.
 const BPF_F_MARK_MANGLED_0: u64 = 1 << 5;
 
-/// What the programs need from an IPv4 header, read once.
 pub struct Packet {
     pub l3: usize,
     pub proto: u8,
@@ -52,15 +44,13 @@ pub fn parse(ctx: &TcContext, prog: u32, l3: usize) -> Option<Packet> {
         l3,
         proto: ctx.load(l3 + net::IPV4_PROTO_OFF).ok()?,
         first_fragment: net::is_first_fragment(frag_off),
-        // Options make the header variable length, so the L4 header is not reliably 20 bytes in.
         l4: l3 + ihl,
         saddr: ctx.load(l3 + net::IPV4_SADDR_OFF).ok()?,
         daddr: ctx.load(l3 + net::IPV4_DADDR_OFF).ok()?,
     })
 }
 
-/// Absolute offset of the L4 checksum, or `None` when there is nothing to fix: either the protocol
-/// carries no pseudo-header checksum, or this is not the first fragment so there is no L4 header.
+/// `None` when there is nothing to fix: no pseudo-header checksum, or not the first fragment.
 #[inline(always)]
 pub fn csum_target(p: &Packet) -> Option<usize> {
     if !p.first_fragment {
@@ -118,7 +108,6 @@ pub fn rewrite_addr(
     true
 }
 
-/// `port_off` is [`net::L4_SPORT_OFF`] or [`net::L4_DPORT_OFF`].
 #[inline(always)]
 pub fn port_in_range(
     ctx: &TcContext,
@@ -157,8 +146,8 @@ pub fn count_rewrite(prog: u32, proto: u8) {
     }
 }
 
-/// Establishes that this is IPv4 and hands off. An Ethernet-framed device says so in the
-/// ethertype; an L3-only device has no such header, so the IP version nibble is the only source.
+/// An Ethernet-framed device says so in the ethertype; an L3-only one has no such header, leaving
+/// the IP version nibble as the only source.
 #[inline(always)]
 fn is_ipv4(ctx: &TcContext, prog: u32, l3_offset: usize) -> bool {
     let version_byte = if l3_offset >= net::ETH_HDR_LEN {
@@ -195,8 +184,7 @@ fn is_ipv4(ctx: &TcContext, prog: u32, l3_offset: usize) -> bool {
     }
 }
 
-/// The preamble both tc programs share: count, read the config, bail if disabled, and establish
-/// that this is IPv4 at the right offset.
+/// The preamble both tc programs share.
 #[inline(always)]
 pub fn run(
     ctx: &mut TcContext,

@@ -1,9 +1,7 @@
 //! Raw access to a `cgroup_sock_addr` context.
 //!
-//! None of the helpers that matter here have safe wrappers in aya — `bpf_sk_lookup_tcp`,
-//! `bpf_sk_lookup_udp`, `bpf_sk_release`, `bpf_get_netns_cookie` and `bpf_setsockopt` are all raw
-//! bindings re-exported from `aya-ebpf-bindings`. This module is where that unsafety is contained;
-//! the policy that uses it lives in `decide` and `restore`.
+//! None of the helpers that matter have safe wrappers in aya, so this module is where that
+//! unsafety is contained; the policy using it lives in `decide` and `restore`.
 
 use aya_ebpf::{
     bindings::{
@@ -14,12 +12,10 @@ use aya_ebpf::{
     helpers::{bpf_setsockopt, bpf_sk_lookup_tcp, bpf_sk_lookup_udp, bpf_sk_release},
 };
 
-/// Every `cgroup_sock_addr` program returns 1 to allow the operation. Returning 0 fails it, which
-/// needlecast never does: it redirects traffic, it does not block it.
+/// 1 allows the operation, 0 fails it. needlecast redirects traffic, it never blocks it.
 pub const ALLOW: i32 = 1;
 
-/// Resolve the lookup in the *caller's* namespace, not the loader's. This is what makes a container
-/// connecting to a port its own namespace is listening on find that socket and be left alone.
+/// The *caller's* namespace, not the loader's — so a container finds its own listener.
 pub const BPF_F_CURRENT_NETNS: u64 = -1i64 as u64;
 
 pub const SOL_TCP: i32 = 6;
@@ -31,7 +27,6 @@ pub enum Proto {
     Udp,
 }
 
-/// The destination port the application asked for, in host order.
 #[inline(always)]
 pub unsafe fn port_of(sa: *mut bpf_sock_addr) -> u16 {
     u16::from_be((*sa).user_port as u16)
@@ -55,15 +50,12 @@ pub unsafe fn write_v6(sa: *mut bpf_sock_addr, w: [u32; 4]) {
     (*sa).user_ip6[3] = w[3];
 }
 
-/// Is anything on this machine listening on the destination?
+/// A zeroed source means only a *listening* socket can match, since an established one needs a
+/// full four-tuple — so presence is a sufficient test and `bpf_sock.state` need not be read. A
+/// wildcard `0.0.0.0` bind matches too, as it would for real delivery.
 ///
-/// The source in the tuple is zeroed, which means only a *listening* socket can match — an
-/// established socket needs a full four-tuple. So presence is a sufficient test and reading
-/// `bpf_sock.state` is unnecessary. A wildcard `0.0.0.0` bind matches too, because the kernel's
-/// wildcard rule applies to the helper lookup exactly as it does to real delivery.
-///
-/// `tuple_size` must be exactly the size of the address-family variant, never the union size, and
-/// every non-null result must be released — the verifier enforces the second.
+/// `tuple_size` must be the address-family variant's size, never the union's. Every non-null
+/// result must be released; the verifier enforces that.
 #[inline(always)]
 pub unsafe fn has_local_listener_v4(
     ctx: *mut c_void,
@@ -116,7 +108,7 @@ pub unsafe fn has_local_listener_v6(
     true
 }
 
-/// `setsockopt` on the socket the context belongs to. Returns the helper's return code.
+/// Returns the helper's return code.
 #[inline(always)]
 pub unsafe fn set_int_sockopt(ctx: *mut c_void, level: i32, optname: i32, mut value: i32) -> i64 {
     bpf_setsockopt(

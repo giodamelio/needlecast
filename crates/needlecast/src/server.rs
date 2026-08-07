@@ -1,7 +1,7 @@
-//! `needlecast server` — the machine whose loopback ports are being reached.
+//! The machine whose loopback ports are being reached.
 //!
-//! It is stateless with respect to the client: it holds nothing about it, so a client that vanishes
-//! needs no cleanup, and the tc programs stay attached and simply never match.
+//! Stateless with respect to the client, so one that vanishes needs no cleanup: the tc programs
+//! stay attached and simply never match.
 
 use std::net::Ipv4Addr;
 
@@ -16,8 +16,8 @@ use crate::identity::{Identity, Role};
 use crate::shutdown::Shutdown;
 use crate::transport::{self, Tunnel};
 
-/// Where a forwarded flow is delivered, and what the peer is reported as. Not configurable: the
-/// point is that what a server is told is byte-identical to a genuinely local connection.
+/// Not configurable: the point is that what a server is told is byte-identical to a genuinely
+/// local connection.
 const LOCAL_V4: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
 pub struct Args {
@@ -66,8 +66,8 @@ pub fn run(a: Args) -> Result<()> {
     tunnel.down()
 }
 
-/// What the tc programs read. Split out from the attach so its shape is testable without a kernel:
-/// a byte-order slip here would be invisible until traffic failed to match.
+/// Split out so its shape is testable without a kernel: a byte-order slip here would be invisible
+/// until traffic failed to match.
 fn sleeve_config(
     transport_v4: Ipv4Addr,
     transport_peer_v4: Ipv4Addr,
@@ -79,7 +79,6 @@ fn sleeve_config(
         transport_v4: bpf::v4_be(transport_v4),
         transport_peer_v4: bpf::v4_be(transport_peer_v4),
         local_v4: bpf::v4_be(LOCAL_V4),
-        // The tunnel is IPv4-only, so the v6 fields exist to be filled in later rather than now.
         transport_v6: [0; 4],
         transport_peer_v6: [0; 4],
         local_v6: [0; 4],
@@ -91,7 +90,7 @@ fn sleeve_config(
     }
 }
 
-/// Holds the links. Dropping it, or dying, detaches every program and reverts the machine.
+/// Dropping it, or dying, detaches every program and reverts the machine.
 pub struct Datapath {
     _ebpf: aya::Ebpf,
     _links: Vec<SchedClassifierLink>,
@@ -131,8 +130,8 @@ impl Datapath {
             &mut links,
         )?;
 
-        // The one program outside the transport interface, and it changes nothing on the machine:
-        // it rewrites only what a server is told about its peer.
+        // The one program outside the transport interface. It changes nothing on the machine —
+        // only what a server is told about its peer.
         let cgroup = std::fs::File::open(bpf::CGROUP_ROOT)
             .with_context(|| format!("opening {}", bpf::CGROUP_ROOT))?;
         let program: &mut CgroupSockAddr = ebpf
@@ -185,9 +184,7 @@ mod tests {
         )
     }
 
-    /// The programs compare raw network-order words against what they read from the packet, so a
-    /// host-order slip here would simply never match and the datapath would silently pass traffic
-    /// through untouched.
+    /// A host-order slip would never match, and the datapath would silently pass everything.
     #[test]
     fn addresses_are_stored_in_network_byte_order() {
         let c = cfg(0);
@@ -196,16 +193,13 @@ mod tests {
         assert_eq!(c.local_v4, net::LOOPBACK_V4);
     }
 
-    /// Where a forwarded flow is delivered is not a knob: what the server is told has to be
-    /// byte-identical to a genuinely local connection.
     #[test]
     fn delivery_is_always_plain_loopback() {
         assert_eq!(LOCAL_V4, Ipv4Addr::LOCALHOST);
         assert!(net::is_loopback_v4(cfg(0).local_v4));
     }
 
-    /// One program serves both device classes by reading the offset from the config rather than
-    /// branching: 14 on an Ethernet-framed link, 0 on an L3-only one such as WireGuard.
+    /// 14 on an Ethernet-framed link, 0 on an L3-only one; one program serves both.
     #[test]
     fn the_l3_offset_is_carried_rather_than_guessed() {
         assert_eq!(cfg(0).l3_offset, 0);
@@ -221,8 +215,7 @@ mod tests {
         assert!(!net::port_in_range(9000, c.port_lo, c.port_hi));
     }
 
-    /// The control port must sit outside the managed range, or the datapath would rewrite the
-    /// control connection's own packets and the plane would be forwarding itself.
+    /// Otherwise the datapath would rewrite the control plane's own packets.
     #[test]
     fn the_control_port_is_outside_the_range_it_serves() {
         let c = cfg(0);
@@ -233,8 +226,7 @@ mod tests {
         ));
     }
 
-    /// Unlike the client, the server is useful the moment it attaches: it holds no state about the
-    /// peer, so there is nothing to wait for before it can serve.
+    /// Unlike the client, it holds no state about the peer, so there is nothing to wait for.
     #[test]
     fn the_datapath_is_enabled_from_the_start() {
         assert_eq!(cfg(0).enabled, 1);

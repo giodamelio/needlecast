@@ -1,11 +1,8 @@
-//! `connect4` and `connect6`: the moment the decision is made.
+//! The moment the decision is made, and the reason needlecast needs no rendezvous socket or
+//! userspace proxy: the kernel calls this synchronously inside `connect()`, before a packet
+//! exists, so the destination can simply be changed and routing does the rest.
 //!
-//! This is the whole reason needlecast needs no rendezvous socket and no userspace proxy. The
-//! kernel calls this program synchronously inside `connect()`, before a single packet exists, so
-//! the destination can simply be changed and routing does the rest.
-//!
-//! It fires for TCP and for *connected* UDP sockets, which decide once here and keep that decision
-//! for the life of the socket. Unconnected UDP goes through `sendmsg` instead.
+//! TCP and *connected* UDP, which decide once here. Unconnected UDP goes through `sendmsg`.
 
 use aya_ebpf::{macros::cgroup_sock_addr, programs::SockAddrContext};
 use needlecast_common::prog;

@@ -1,18 +1,12 @@
-//! Both keypairs, derived from one file.
-//!
-//! There is no pairing step and nothing to exchange: each side derives *both* keypairs from the
-//! same secret, keeps its own private key, and uses the other's public key as the WireGuard peer.
-//! Generate the secret once and copy it across:
+//! Both keypairs from one file, so there is no pairing step and nothing to exchange.
 //!
 //! ```text
 //! head -c 32 /dev/urandom | base64 > secret
 //! chmod 600 secret
 //! ```
 //!
-//! **The secret file is both machines' identity.** Anyone holding it can impersonate either side,
-//! and there is no revocation short of replacing it on both. That is the price of having no pairing
-//! step, and for two personal machines it is the right trade — but it is why a loose file mode is a
-//! hard error here rather than a warning, and why a lost laptop is a rotate-the-secret event.
+//! **The secret is both machines' identity**, with no revocation short of replacing it on both.
+//! Hence a loose file mode being a hard error rather than a warning.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -23,8 +17,7 @@ use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-/// Changing either string changes every derived key, so both machines must be upgraded together.
-/// The version suffix is what makes that a deliberate act rather than a silent break.
+/// Changing either string changes every derived key; the version suffix makes that deliberate.
 const SERVER_INFO: &[u8] = b"needlecast server key v1";
 const CLIENT_INFO: &[u8] = b"needlecast client key v1";
 
@@ -63,13 +56,13 @@ pub struct KeyPair {
 }
 
 impl KeyPair {
-    /// WireGuard's own encoding, so this can be compared against `wg show` output directly.
+    /// WireGuard's own encoding, so it compares directly against `wg show`.
     pub fn public_base64(&self) -> String {
         base64::engine::general_purpose::STANDARD.encode(self.public)
     }
 }
 
-/// Deliberately no `Debug`: a stray `{:?}` would put a private key in a log.
+/// No `Debug`: a stray `{:?}` would put a private key in a log.
 pub struct Identity {
     pub role: Role,
     pub own: KeyPair,
@@ -92,20 +85,19 @@ impl Identity {
 }
 
 fn keypair(secret: &[u8], role: Role) -> KeyPair {
-    // No salt: the secret is already 32 bytes of real randomness, and a salt neither side could
-    // agree on separately would have to be derived from the same file anyway.
+    // No salt: the secret is already 32 bytes of real randomness, and any salt would have to come
+    // from the same file anyway.
     let hk = Hkdf::<Sha256>::new(None, secret);
     let mut private = [0u8; 32];
     hk.expand(role.info(), &mut private)
         .expect("32 bytes is a valid HKDF-SHA256 output length");
-    // X25519 clamps when it derives, which is what WireGuard does too — so the public key here is
-    // byte-identical to what `wg pubkey` would print for the same private key.
+    // X25519 clamps on derivation, as WireGuard does, so this matches `wg pubkey` byte for byte.
     let public = PublicKey::from(&StaticSecret::from(private)).to_bytes();
     KeyPair { private, public }
 }
 
-/// The file's bytes with trailing ASCII whitespace trimmed, so the `base64 > secret` recipe works
-/// verbatim rather than depending on whether the shell left a newline.
+/// Trailing whitespace is trimmed so the `base64 > secret` recipe works whether or not the shell
+/// left a newline.
 fn read_secret(path: &Path) -> Result<Vec<u8>> {
     let meta = std::fs::metadata(path)
         .with_context(|| format!("reading the secret at {}", path.display()))?;
@@ -141,22 +133,12 @@ mod tests {
 
     const SECRET: &[u8] = b"gCPmMEnG3ZucCkC2gzcTGKvIETyufAJXWr6zJVCKk4Q=";
 
-    /// Cross-checked against an independent HKDF-SHA256 implementation and the real `wg pubkey`,
-    /// which is what proves both the derivation and that X25519 clamping here matches WireGuard's:
-    ///
-    /// ```text
-    /// $ hkdf_sha256(SECRET, "needlecast server key v1") | base64 | wg pubkey
-    /// ZVnbvcoGI3M2tQwGjUgMjlpUh7hRAZ6ve0/6iCJ0Y3Y=
-    /// ```
-    ///
-    /// Regenerating these rather than fixing a failure is how the lock gets silently unlocked, so
-    /// treat a mismatch as a protocol change needing both machines upgraded.
+    /// Cross-checked against an independent HKDF-SHA256 implementation and the real `wg pubkey`.
+    /// Regenerating these rather than fixing a failure silently unlocks the lock; treat a mismatch
+    /// as a protocol change needing both machines upgraded.
     const SERVER_PUBLIC: &str = "ZVnbvcoGI3M2tQwGjUgMjlpUh7hRAZ6ve0/6iCJ0Y3Y=";
     const CLIENT_PUBLIC: &str = "quNwuLJbIui3Quc9cqyXZEbtE22/YzLyou6PbbhKw1I=";
 
-    /// Locks the derivation. If either info string, the hash, or the HKDF parameters change, both
-    /// machines stop agreeing on keys — so that has to be a deliberate act with a version bump,
-    /// not a refactor.
     #[test]
     fn derivation_is_stable() {
         let id = Identity::derive(SECRET, Role::Server);
@@ -164,8 +146,6 @@ mod tests {
         assert_eq!(id.peer.public_base64(), CLIENT_PUBLIC);
     }
 
-    /// The whole reason there is no pairing step: each side computes the same two keypairs and
-    /// simply keeps a different one.
     #[test]
     fn both_sides_derive_the_same_pair_and_keep_opposite_halves() {
         let server = Identity::derive(SECRET, Role::Server);
@@ -212,8 +192,8 @@ mod tests {
         }
     }
 
-    /// Leading whitespace is *not* trimmed, because it would be part of a deliberately chosen
-    /// secret rather than an artefact of how the file was written.
+    /// Unlike trailing, leading whitespace is part of a chosen secret rather than an artefact of
+    /// how the file was written.
     #[test]
     fn leading_whitespace_is_significant() {
         let mut led = b" ".to_vec();
@@ -254,7 +234,7 @@ mod tests {
             dir
         }
 
-        /// `Identity` has no `Debug` on purpose, so `expect_err` is unavailable.
+        /// `Identity` has no `Debug`, so `expect_err` is unavailable.
         fn refusal(r: Result<Identity>, what: &str) -> anyhow::Error {
             match r {
                 Ok(_) => panic!("{what} should have been refused"),

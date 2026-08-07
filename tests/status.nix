@@ -8,9 +8,8 @@
   s = import ./lib/scenarios.nix {inherit pkgs;};
   common = s.node {inherit kernelPackages needlecast;};
 in
-  # `status` takes no IPC dependency on the daemon, because the moment it is worth having is
-  # exactly the moment the daemon is wedged or dead. Each of the four states is reached for real
-  # here rather than simulated.
+  # No IPC dependency on the daemon, because the moment it is worth having is the moment the daemon
+  # is wedged. Each of the four states is reached for real rather than simulated.
   testers.runNixOSTest {
     name = "needlecast-status-${variant}";
 
@@ -51,8 +50,7 @@ in
           assert st.get("ports") == f"{PORT_LO}-{PORT_HI}", st
           assert str(PORT) in st.get("server_listeners", ""), st
           assert st.get("interface") == IFACE, st
-          # A handshake that has happened is the difference between "the tunnel is configured" and
-          # "the tunnel works", which is the whole reason to report it.
+          # The difference between "configured" and "works".
           assert st.get("handshake", "never") != "never", st
 
       with subtest("status lists what is actually forwarded"):
@@ -82,24 +80,23 @@ in
           st = status(client, "client")
           print(st)
           assert st.get("enabled") == "0", st
-          # The listener set is cleared rather than left stale, and `status` shows that.
+          # Cleared rather than left stale.
           assert st.get("server_listeners") == "", st
-          # The interface is still ours and still up: only the control connection is down.
+          # Still ours and still up: only the control connection is down.
           assert st.get("interface") == IFACE, st
 
       with subtest("not running: the process died but its state is still on disk"):
-          # A crash, not a clean stop, so nothing gets a chance to tidy up.
+          # A crash, so nothing gets a chance to tidy up.
           client.succeed("systemctl kill -s SIGKILL ncclient.service || true")
           client.wait_until_fails("systemctl is-active ncclient.service", timeout=30)
-          # The map pins survive the process — which is exactly why they are not what `status`
-          # uses to decide whether a daemon is alive.
+          # They survive the process, which is why `status` does not key on them.
           client.succeed("test -d /sys/fs/bpf/needlecast/client")
           st = status(client, "client")
           print(st)
           assert st.get("state") == "not-running", st
 
       with subtest("status works when the daemon is dead, which is when it is worth having"):
-          # No IPC anywhere in that path: the command above just succeeded with no process to ask.
+          # The command above just succeeded with no process to ask.
           assert "cgroup_sock_addr" not in client.succeed("bpftool prog show | grep -c . || true")
           out = client.succeed("needlecast status --role client")
           assert "role=client" in out, out

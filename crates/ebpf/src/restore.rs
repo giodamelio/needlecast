@@ -1,12 +1,8 @@
-//! The laptop's undo: report the address the application asked for, not the one it got.
+//! Report the address the application asked for, not the one it got.
 //!
-//! Shared by `getpeername4`/`getpeername6` and `recvmsg4`/`recvmsg6`. Because the port is never
-//! translated, restoring the address is enough and needs no per-connection state — the same reason
-//! the whole datapath is stateless.
-//!
-//! This is the same mechanism the desktop uses in reverse: the laptop rewrites the packet and hides
-//! that from the client, the desktop leaves the packet alone and presents loopback to the server.
-//! In both cases what must change is what an application observes, not what the wire carries.
+//! Because the port is never translated, restoring the address is enough and needs no
+//! per-connection state. The server uses the same mechanism in reverse: what must change is what
+//! an application observes, not what the wire carries.
 
 use aya_ebpf::programs::SockAddrContext;
 use needlecast_common::{ev, net, CONFIG_KEY};
@@ -25,7 +21,7 @@ pub unsafe fn restore_v4(ctx: &SockAddrContext, prog: u32) -> i32 {
         bump(prog, ev::DISABLED);
         return ALLOW;
     }
-    // Only an address we put there gets undone; every other socket on the machine passes through.
+    // Only an address we put there; every other socket on the machine passes through.
     if (*sa).user_ip4 != cfg.target_v4 {
         return ALLOW;
     }
@@ -57,7 +53,7 @@ pub unsafe fn restore_v6(ctx: &SockAddrContext, prog: u32) -> i32 {
         return ALLOW;
     }
 
-    // A mapped destination was rewritten in its v4 half, so it is restored the same way.
+    // Rewritten in its v4 half, so restored the same way.
     if let Some(v4) = net::mapped_v4(&addr) {
         if v4 == cfg.target_v4 {
             write_v6(sa, [addr[0], addr[1], addr[2], net::LOOPBACK_V4]);
@@ -66,8 +62,7 @@ pub unsafe fn restore_v6(ctx: &SockAddrContext, prog: u32) -> i32 {
         return ALLOW;
     }
 
-    // With no v6 target nothing was ever rewritten to it, so there is nothing to undo — and an
-    // all-zero comparison would otherwise match the unspecified address.
+    // Nothing was rewritten to it, and an all-zero comparison would match the unspecified address.
     if cfg.target_v6 != [0; 4] && addr == cfg.target_v6 {
         write_v6(sa, net::LOOPBACK_V6);
         bump(prog, ev::RESTORED);

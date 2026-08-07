@@ -144,13 +144,13 @@ in
           established = desktop.succeed("ss -tn state established | grep ':8081'")
           print(established)
           assert "127.0.0.1:8081" in established, established
-          # The wire is never rewritten on the source side inbound, so the kernel's peer is the
-          # client's transport address. What the *application* is told is covered separately.
+          # The source is never rewritten inbound, so the kernel's peer is the client's transport
+          # address. What the *application* is told is covered separately.
           assert LAPTOP in established, established
 
-      # The server's socket is on loopback, whose MTU is 65536, but the segments have to fit the
-      # transport. The client's SYN advertises against its own route, so this should fall out
-      # without anything clamping it — asserted because "should fall out" is a prediction.
+      # The server's socket is on loopback (MTU 65536) but its segments must fit the transport.
+      # The client's SYN advertises against its own route, so this falls out with no clamping —
+      # asserted because that was a prediction.
       with subtest("MSS is negotiated against the transport MTU, not loopback's"):
           info = desktop.succeed("ss -tni state established | grep -A1 ':8081' | head -4")
           print(info)
@@ -230,13 +230,11 @@ in
           print(f"non-first fragments seen inbound: {frags}")
 
       with subtest("an IPv4 UDP datagram with a zero checksum keeps it"):
-          # If the fixup recomputed a checksum over a zero field the receiver would drop the
-          # datagram, so a successful echo is the assertion.
+          # A recomputed checksum over the zero field would make the receiver drop it.
           r = connect(8083, "--udp --unconnected --no-check --timeout 20")
           assert r.get("data", "").startswith("udp-desktop"), r
 
-      # The design assumed a per-interface sysctl and a per-interface one is what it needs. Asserted
-      # so a future change that reaches for `all` fails here rather than in review.
+      # So a future change reaching for `all` fails here rather than in review.
       with subtest("nothing outside the transport interface is touched"):
           for key in ("net.ipv4.conf.all.route_localnet",
                       "net.ipv4.conf.lo.route_localnet",
@@ -250,9 +248,8 @@ in
           assert r.get("error") in ("ECONNREFUSED", "TIMEOUT"), r
           start_datapath()
 
-      # The requirement is that the dev server cannot tell a forwarded connection from a local one.
-      # Measured as what the server *application* is told, since that is what the requirement is
-      # about — `ss` reads the kernel socket table and is shown only for contrast.
+      # Measured as what the *application* is told, since that is what the requirement is about.
+      # `ss` reads the kernel socket table and is shown only for contrast.
       with subtest("the server cannot distinguish a forwarded connection from a local one"):
 
           def app_peer(unit, port):
@@ -286,12 +283,10 @@ in
           print(f"server sees={forwarded}  ss shows={kernel_view}")
 
           assert forwarded == "127.0.0.1", forwarded
-          # `ss` still shows the truth, which is a feature: the operator debugging the machine
-          # sees the real tunnel address while the application sees loopback.
+          # A feature: the operator sees the truth, the application does not.
           assert kernel_view == LAPTOP, kernel_view
 
-          # The point of the whole exercise: byte-identical to a connection made on the server
-          # itself, so no comparison a server can make through the socket API separates them.
+          # Byte-identical to a connection made on the server itself, so nothing separates them.
           serve("localsrv", "127.0.0.1", 8087, "invisible", "--hold 120")
           desktop.wait_until_succeeds("ss -lnt | grep -q '127.0.0.1:8087'", timeout=30)
           desktop.succeed(

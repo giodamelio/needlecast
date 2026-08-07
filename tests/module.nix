@@ -8,8 +8,7 @@
 }: let
   s = import ./lib/scenarios.nix {inherit pkgs;};
 
-  # The secret has to exist before the unit starts, and it must not be in the store — which is
-  # exactly the constraint a real installation has. `LoadCredential` reads it from here.
+  # Before the unit starts and out of the store, as a real installation has it.
   placeSecret = ''
     install -Dm600 /dev/null /var/lib/needlecast/secret
     printf %s '${s.secretText}' > /var/lib/needlecast/secret
@@ -26,8 +25,7 @@
     system.activationScripts.needlecastSecret.text = placeSecret;
   };
 in
-  # Everything else drives the daemon with `systemd-run`, which cannot catch a module that passes a
-  # flag the binary does not have. This builds both machines the way a person would install them.
+  # `systemd-run` elsewhere cannot catch a module passing a flag the binary does not have.
   testers.runNixOSTest {
     name = "needlecast-module-${variant}";
 
@@ -80,8 +78,7 @@ in
           client.wait_until_succeeds(f"ip link show {IFACE}", timeout=60)
 
       with subtest("the secret is read through a credential, not from the store"):
-          # The unit never names the file on its command line, so a `ps` cannot leak the path
-          # a reader would have to know.
+          # Never on the command line, so `ps` cannot leak the path.
           unit = client.succeed("systemctl cat needlecast-client.service")
           print(unit)
           assert "LoadCredential=secret:" in unit, unit
@@ -96,13 +93,11 @@ in
               print(out.strip())
               assert "78" in out, out
 
-      # The module uses only the ordinary `networking.firewall` options, so this is asserted by
-      # behaviour rather than by grepping a ruleset — which would bind the test to one backend and
-      # tell you nothing about whether traffic actually flows.
+      # Behavioural rather than grepping a ruleset, which would bind this to one backend and say
+      # nothing about whether traffic flows.
       with subtest("a port outside the managed range is not reachable over the tunnel"):
-          # Bound to 0.0.0.0 so it is reachable on the tunnel address if anything lets it through,
-          # and outside the range so nothing should. This is the assertion the narrow rules exist
-          # for: without them, trusting the interface would quietly make this succeed.
+          # Reachable on the tunnel address if anything lets it through, and outside the range so
+          # nothing should. Trusting the interface would quietly make this succeed.
           server.succeed(
               "systemd-run --unit=outside --collect "
               "nc-probe serve --bind 0.0.0.0 --port 9500 --token should-not-be-reachable --hold 60"

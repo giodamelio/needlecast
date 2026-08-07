@@ -8,8 +8,8 @@
   s = import ./lib/scenarios.nix {inherit pkgs;};
   common = s.node {inherit kernelPackages needlecast;};
 in
-  # The control plane's one load-bearing job is liveness: without it the client keeps rewriting
-  # toward a server that is gone, and a connection hangs on SYN retransmit instead of failing.
+  # Liveness is the load-bearing job: without it the client keeps rewriting toward a server that is
+  # gone, and connections hang on SYN retransmit instead of failing.
   testers.runNixOSTest {
     name = "needlecast-control-${variant}";
 
@@ -39,8 +39,7 @@ in
       with subtest("the client starts disabled and stays that way until the server answers"):
           start_client(client, peer="server")
           assert config().get("enabled") == "0", config()
-          # Nothing is rewritten while disabled, so this is stock behaviour: an instant, correct
-          # refusal rather than a hang.
+          # Stock behaviour: an instant, correct refusal rather than a hang.
           r = local(client, PORT, "--timeout 5")
           assert r.get("error") == "ECONNREFUSED", r
           print("no server: " + str(config()))
@@ -54,7 +53,7 @@ in
           assert r.get("data") == "server-side", r
 
       with subtest("the managed range comes from the server, not from a flag on this side"):
-          # The client is never told a range; it adopts whatever the server says it serves.
+          # Never told a range; it adopts whatever the server says it serves.
           cfg = config()
           assert cfg.get("port_lo") == str(PORT_LO), cfg
           assert cfg.get("port_hi") == str(PORT_HI), cfg
@@ -115,9 +114,8 @@ in
           print(f"rewritten +{rewritten}, setsockopt ok +{ok} err +{err}")
           assert ok == rewritten and err == 0, (before, after)
 
-      # The heartbeat is fast only while something is riding the tunnel, because that is when a
-      # stale enabled flag costs something. Holding a connection open is what makes it speed up,
-      # and is also what makes the next subtest measurable in seconds rather than half a minute.
+      # Holding a connection open is what speeds the heartbeat up, and what makes the next subtest
+      # measurable in seconds rather than half a minute.
       with subtest("the heartbeat speeds up while a connection is open"):
           serve(server, "held", 8088, "held-open", "--hold 120")
           server.wait_until_succeeds("ss -lnt | grep -q '127.0.0.1:8088'", timeout=30)
@@ -130,7 +128,7 @@ in
               "> /tmp/held.out 2>&1 &"
           )
           client.wait_until_succeeds("grep -q '^data=' /tmp/held.out", timeout=20)
-          # `status` reports the flow, which is the same reading the heartbeat uses to decide.
+          # The same reading the heartbeat uses to decide.
           out = client.succeed("needlecast status --role client")
           print(out)
           assert "forwarded=" in out, out
@@ -138,8 +136,8 @@ in
       # If either half of this failed, the control plane would be forwarding itself.
       with subtest("the control connection is never itself forwarded"):
           import time as _t
-          # The server's tc ingress skips it as out of range, which is visible as a rising counter
-          # while the heartbeat runs — and it is running once a second now.
+          # tc ingress skips it as out of range, visible as a rising counter while the heartbeat
+          # runs — once a second, now that a connection is open.
           b = counters(server, "tc-counters")
           _t.sleep(6)
           a = counters(server, "tc-counters")
@@ -148,9 +146,8 @@ in
           print(f"tc_ingress.port_out_of_range +{delta} while the heartbeat ran")
           assert delta >= 1, (b, a)
 
-          # And the client declines it as non-loopback rather than rewriting it. Measured across a
-          # fresh reconnect, since that is when the control socket is actually created — so the
-          # window has to contain a real disconnect, not merely a fast server restart.
+          # The client declines it as non-loopback. Measured across a real disconnect, since that
+          # is when the control socket is created — a fast restart would not contain one.
           before = counters(client, "counters")
           server.succeed("systemctl stop ncserver.service")
           client.wait_until_succeeds(

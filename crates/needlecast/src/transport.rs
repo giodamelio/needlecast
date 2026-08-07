@@ -1,9 +1,7 @@
-//! The `needle` interface: created, configured, and removed by needlecast itself.
+//! The `needle` interface, created and removed by needlecast itself.
 //!
-//! Nothing else on the machine is touched. The one sysctl needed —
-//! `net.ipv4.conf.needle.route_localnet=1`, and only on the server — lives in a directory the
-//! kernel creates when the interface appears and destroys when it goes away, so it is a property of
-//! our own interface rather than a machine setting, and it cannot outlive the daemon.
+//! Nothing else on the machine is touched. The one sysctl — `route_localnet`, server only — lives
+//! in a directory the kernel creates and destroys with the interface, so it cannot outlive us.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
@@ -15,40 +13,29 @@ use defguard_wireguard_rs::{
 
 use crate::identity::{Identity, Role};
 
-/// `IF_NAMESIZE` is 16, so 15 characters are usable. Six is comfortable and unlikely to collide.
+/// `IF_NAMESIZE` is 16, so 15 characters are usable.
 pub const IFACE: &str = "needle";
 
-/// `198.18.0.0/15` is RFC 2544 space, reserved for benchmarking network equipment, and is the
-/// best-kept-free range in IPv4. `10/8` and `192.168/16` are home routers and corporate VPNs;
-/// Docker's bridge is `172.17/16` and compose walks up from `172.18`; `100.64/10` is CGNAT and
-/// Tailscale; `240/4` is Class E, which many stacks refuse to route.
-///
-/// Not `169.254/16`: the kernel and DHCP clients hand those out themselves when DHCP fails, cloud
-/// metadata lives at `169.254.169.254`, and `scope link` is not merely a label — source address
-/// selection deprioritises it and several paths assume the destination is on the same segment.
+/// RFC 2544 benchmarking space: reserved, never routed, and not claimed by NAT gear or container
+/// runtimes. Every other candidate is taken — see DESIGN.md, which rules out `169.254/16` at
+/// length because the kernel hands those addresses out itself.
 pub const SERVER_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 pub const CLIENT_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 
-/// The address carries a `/24` so the on-link route exists; the peer's `allowed-ips` is a `/32`,
-/// which is as tight as it can be with exactly one peer.
+/// A `/24` on the interface for the on-link route; a `/32` of `allowed-ips` for the peer.
 const PREFIX_V4: u8 = 24;
 const PEER_PREFIX_V4: u8 = 32;
 
 const MTU: u32 = 1420;
 
-/// Only has to be stable and memorable, not secret. It sits beside the control port so the two are
-/// obviously related.
+/// Only has to be stable, not secret. Beside the control port so the two are obviously related.
 pub const DEFAULT_LISTEN_PORT: u16 = 47654;
 
-/// Sent by the client only. The server is the one with a stable address, so it is the client's job
-/// to keep a path open through whatever NAT it is behind.
+/// Client only: the server has the stable address, so holding the NAT hole open is our job.
 const KEEPALIVE_SECS: u16 = 25;
 
-/// How the two ends address each other.
-///
-/// The v6 halves are `None` today: the desktop datapath is IPv4-only, and DESIGN.md's eventual
-/// answer is a random IPv6 ULA `/48` rather than another well-known range. The shape is here so
-/// that arrives as new code rather than as a change to everything that reads a plan.
+/// The v6 halves are `None` until the server datapath speaks v6; the shape is here so that arrives
+/// as new code rather than a change to everything that reads a plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub own_v4: Ipv4Addr,
@@ -90,18 +77,16 @@ pub struct Tunnel {
     role: Role,
     private_key: Key,
     peer_key: Key,
-    /// The peer's DNS name and port, kept so it can be resolved again. WireGuard resolves an
-    /// endpoint once and then holds that address forever; if the peer moves, the tunnel is dead
-    /// until something updates it. That something is us.
+    /// WireGuard resolves an endpoint once and holds it forever, so a peer that moves is
+    /// unreachable until we re-resolve.
     endpoint: String,
     resolved: Option<SocketAddr>,
     listen_port: u16,
 }
 
 impl Tunnel {
-    /// Brings the interface up. Idempotent: a leftover `needle` from a crashed run is replaced
-    /// rather than adopted in whatever state it was left in, because the interface is ours alone
-    /// and a known-good one costs a single handshake to re-establish.
+    /// A leftover `needle` is replaced rather than adopted: the interface is ours alone, and a
+    /// known-good one costs a single handshake where an inherited one costs unknown state.
     pub fn up(identity: &Identity, peer_endpoint: &str, listen_port: u16) -> Result<Self> {
         let plan = Plan::for_role(identity.role);
         let mut api =
@@ -126,8 +111,7 @@ impl Tunnel {
             resolved: None,
             listen_port,
         };
-        // Not fatal: the peer may simply not be resolvable yet, and the client retries on every
-        // reconnect. The interface is still worth having up so the peer can reach *us*.
+        // Not fatal: the interface is still worth having up so the peer can reach *us*.
         if let Err(e) = tunnel.resolve() {
             log::warn!("could not resolve {peer_endpoint} yet: {e:#}");
         }
@@ -172,10 +156,8 @@ impl Tunnel {
         Ok(())
     }
 
-    /// Re-resolve the peer's name and update WireGuard if the answer changed.
-    ///
-    /// Returns whether it changed, so a caller can log a roam rather than a heartbeat. Call it on
-    /// every reconnect attempt while disconnected, and every few minutes while connected.
+    /// Returns whether the address changed. Call on every reconnect attempt while disconnected,
+    /// and every few minutes while connected.
     pub fn refresh_endpoint(&mut self) -> Result<bool> {
         let previous = self.resolved;
         self.resolve()?;
@@ -215,8 +197,7 @@ impl Tunnel {
         self.plan.peer_v4
     }
 
-    /// A clean exit leaves no trace: no interface, no addresses, and the sysctl directory goes with
-    /// it. Consumes `self` so the `Drop` path cannot also run.
+    /// Consumes `self` so the `Drop` path cannot also run.
     pub fn down(self) -> Result<()> {
         let api = std::mem::ManuallyDrop::new(self);
         api.api
@@ -235,11 +216,8 @@ impl Drop for Tunnel {
     }
 }
 
-/// Which resolved address to use as the WireGuard endpoint.
-///
-/// Prefers IPv4. The tunnel's own addressing is v4-only, and a machine that publishes an AAAA it
-/// cannot actually be reached over would otherwise leave the handshake failing with nothing to
-/// point at. A v6-only name still works — there is simply no better choice to make.
+/// Prefers IPv4: the tunnel is v4-only, and a machine publishing an AAAA it cannot be reached over
+/// would leave the handshake failing with nothing to point at.
 fn pick_endpoint(addrs: &[SocketAddr]) -> Option<SocketAddr> {
     addrs
         .iter()
@@ -257,13 +235,8 @@ fn base64_key(key: &Key) -> String {
     base64::engine::general_purpose::STANDARD.encode(key.as_array())
 }
 
-/// Without this the inbound packet is dropped as martian once its destination has been rewritten
-/// to `127.0.0.1`, which shows up as a hung connect rather than a clean error.
-///
-/// Scoped to our own interface: `all`, `default` and `lo` stay at `0`, and the desktop suite
-/// asserts that rather than leaving it to inspection. The blast radius is that packets *arriving on
-/// `needle`* may address `127.0.0.0/8` — and the only thing that can put a packet there is a peer
-/// that passed WireGuard's authentication, which is exactly what the server exists to serve.
+/// Without this the rewritten packet is dropped as martian, which shows up as a hung connect
+/// rather than a clean error. Scoped to our own interface; `all`, `default` and `lo` stay at `0`.
 fn set_route_localnet() -> Result<()> {
     let path = format!("/proc/sys/net/ipv4/conf/{IFACE}/route_localnet");
     std::fs::write(&path, "1").with_context(|| format!("writing {path}"))?;
@@ -293,8 +266,6 @@ mod tests {
         }
     }
 
-    /// The ranges deliberately avoided, asserted so a future change to the constants cannot quietly
-    /// land in one of them.
     #[test]
     fn the_addresses_avoid_every_range_the_design_ruled_out() {
         for addr in [SERVER_V4, CLIENT_V4] {
@@ -316,7 +287,6 @@ mod tests {
         assert_eq!(allowed[0].cidr, 32);
     }
 
-    /// A `/32` on the interface would leave no on-link route to the peer.
     #[test]
     fn the_interface_address_carries_a_subnet() {
         let plan = Plan::for_role(Role::Client);
@@ -339,8 +309,6 @@ mod tests {
         assert!(IFACE.len() < 16, "{IFACE} exceeds IF_NAMESIZE - 1");
     }
 
-    /// The control port must not collide with the WireGuard port: one is inside the tunnel and one
-    /// is on the internet, but a shared number would be a confusing coincidence at best.
     #[test]
     fn the_two_fixed_ports_differ() {
         assert_ne!(
@@ -360,15 +328,12 @@ mod tests {
             SocketAddr::from(("2001:db8::2".parse::<Ipv6Addr>().unwrap(), port))
         }
 
-        /// The case a real test found: the resolver answers with the AAAA first, and following it
-        /// would leave the handshake failing on a machine reachable only over v4.
-        #[test]
+            #[test]
         fn the_a_record_wins_even_when_the_aaaa_comes_first() {
             assert_eq!(pick_endpoint(&[v6(47654), v4(47654)]), Some(v4(47654)));
             assert_eq!(pick_endpoint(&[v4(47654), v6(47654)]), Some(v4(47654)));
         }
 
-        /// A v6-only name still works: there is simply no better choice to make.
         #[test]
         fn a_v6_only_name_is_used_rather_than_refused() {
             assert_eq!(pick_endpoint(&[v6(47654)]), Some(v6(47654)));

@@ -8,22 +8,19 @@
 }: let
   s = import ./lib/scenarios.nix {inherit pkgs;};
 
-  # A real installation has the secret on disk before the unit starts, out of the store. This is
-  # the same constraint, met the same way.
+  # On disk before the unit starts and out of the store, as a real installation has it.
   placeSecret = ''
     install -Dm600 /dev/null /var/lib/needlecast/secret
     printf %s '${s.secretText}' > /var/lib/needlecast/secret
   '';
 
-  # Host ports you can reach the two machines on while the driver is paused, and the throwaway key
-  # that gets you in. Shared with `nix run .#demo-ssh`, so the two cannot disagree.
+  # Shared with `nix run .#demo-ssh`, so the two cannot disagree.
   inherit (s.demoSsh) ports snakeOilPublicKey;
 
   common = name: {
     imports = [module];
     boot.kernelPackages = kernelPackages;
-    # On, because a real machine has it on, and because needlecast having to ask for what it needs
-    # is part of what this is demonstrating.
+    # On, because needlecast having to ask for what it needs is part of the demonstration.
     networking.firewall.enable = true;
     virtualisation.vlans = [1];
     virtualisation.memorySize = 2048;
@@ -36,9 +33,8 @@
       }
     ];
 
-    # Key only, so there is no password to get wrong and none to leave enabled by accident. The
-    # test framework gives root an empty `hashedPasswordFile` that would otherwise win over anything
-    # set here, which is its own reason not to go the password route.
+    # Key only: the framework gives root an empty `hashedPasswordFile` that wins over any password
+    # set here, so that route cannot work.
     services.openssh = {
       enable = true;
       settings.PermitRootLogin = "prohibit-password";
@@ -56,20 +52,16 @@
     system.activationScripts.needlecastSecret.text = placeSecret;
   };
 in
-  # The smallest thing that is still a real installation: two machines, one secret, the module on
-  # both, and a dev server the other side reaches as `localhost`. Everything else in `tests/` is
-  # trying to catch a specific way this could be wrong; this one is just the thing working.
-  #
-  # To poke at it:
+  # The smallest thing that is still a real installation. Everything else in `tests/` catches a
+  # specific way this could be wrong; this is just the thing working.
   #
   #     nix run .#demo
-  #     >>> start_all()                      # only what you type runs; the script below does not
-  #     >>> client.shell_interact()          # a root shell on the console
+  #     >>> start_all()              # interactive mode runs only what you type
+  #     >>> client.shell_interact()
   #
-  # or, from another terminal once `start_all()` has run:
+  # or, from another terminal:
   #
   #     nix run .#demo-ssh -- client
-  #     nix run .#demo-ssh -- server
   #     nix run .#demo-ssh -- client curl -sf http://localhost:8080/hello.txt
   testers.runNixOSTest {
     name = "needlecast-demo-${variant}";
@@ -82,13 +74,11 @@ in
         secretFile = "/var/lib/needlecast/secret";
       };
 
-      # The thing worth reaching: an ordinary dev server, bound to loopback exactly as you would
-      # bind one, with no idea needlecast exists.
+      # An ordinary dev server, bound to loopback, with no idea needlecast exists.
       systemd.services.devserver = {
         wantedBy = ["multi-user.target"];
-        # Declared here rather than written by the test script: in interactive mode the script does
-        # not run, and a demo whose one interesting file only exists under `nix flake check` would
-        # be useless at exactly the moment you booted it to look around.
+        # Not written by the test script: in interactive mode that does not run, and the one
+        # interesting file would be missing exactly when you booted this to look around.
         preStart = ''
           mkdir -p /var/www
           echo "hello from the other machine" > /var/www/hello.txt
@@ -120,7 +110,7 @@ in
           "needlecast status --role client | grep -q 'state=connected'", timeout=90
       )
 
-      # The whole point, in one line: `localhost` on the client, a server on the other machine.
+      # The whole point, in one line.
       got = client.succeed("curl -sf http://localhost:8080/hello.txt").strip()
       print(f"client curled localhost:8080 and got: {got}")
       assert got == "hello from the other machine", got
@@ -128,9 +118,7 @@ in
       print(client.succeed("needlecast status"))
       print(server.succeed("needlecast status"))
 
-      # The point of this suite is that you can boot it and look around, so the way in is asserted
-      # rather than merely documented — otherwise it rots silently and you find out at the moment
-      # you wanted it.
+      # Asserted rather than documented, or it rots silently.
       for m in (server, client):
           m.wait_for_open_port(22)
 
