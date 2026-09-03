@@ -9,7 +9,7 @@
 //! L4 checksum to fix. They are admitted on the address alone, which identifies the flow here.
 
 use aya_ebpf::{bindings::TC_ACT_OK, programs::TcContext};
-use needlecast_common::{net, tcev, SleeveConfig};
+use needlecast_common::{net, SleeveConfig, TcEv, TcProg};
 
 use crate::maps::{tc_bump, SLEEVE_CONFIG};
 
@@ -32,11 +32,11 @@ pub struct Packet {
 }
 
 #[inline(always)]
-pub fn parse(ctx: &TcContext, prog: u32, l3: usize) -> Option<Packet> {
+pub fn parse(ctx: &TcContext, prog: TcProg, l3: usize) -> Option<Packet> {
     let version_ihl: u8 = ctx.load(l3).ok()?;
     let ihl = net::ihl_bytes(version_ihl);
     if ihl < net::IPV4_MIN_HDR {
-        tc_bump(prog, tcev::SHORT);
+        tc_bump(prog, TcEv::Short);
         return None;
     }
     let frag_off: u16 = ctx.load(l3 + net::IPV4_FRAG_OFF).ok()?;
@@ -63,7 +63,7 @@ pub fn csum_target(p: &Packet) -> Option<usize> {
 #[inline(always)]
 pub fn rewrite_addr(
     ctx: &mut TcContext,
-    prog: u32,
+    prog: TcProg,
     p: &Packet,
     addr_off: usize,
     new_addr: u32,
@@ -77,7 +77,7 @@ pub fn rewrite_addr(
         return true;
     }
     if ctx.store(p.l3 + addr_off, &new_addr, 0).is_err() {
-        tc_bump(prog, tcev::STORE_ERR);
+        tc_bump(prog, TcEv::StoreErr);
         return false;
     }
     if ctx
@@ -89,7 +89,7 @@ pub fn rewrite_addr(
         )
         .is_err()
     {
-        tc_bump(prog, tcev::CSUM_ERR);
+        tc_bump(prog, TcEv::CsumErr);
         return false;
     }
     if let Some(off) = l4_csum_off {
@@ -101,7 +101,7 @@ pub fn rewrite_addr(
             .l4_csum_replace(off, old_addr as u64, new_addr as u64, flags)
             .is_err()
         {
-            tc_bump(prog, tcev::CSUM_ERR);
+            tc_bump(prog, TcEv::CsumErr);
             return false;
         }
     }
@@ -111,13 +111,13 @@ pub fn rewrite_addr(
 #[inline(always)]
 pub fn port_in_range(
     ctx: &TcContext,
-    prog: u32,
+    prog: TcProg,
     p: &Packet,
     cfg: &SleeveConfig,
     port_off: usize,
 ) -> bool {
     if !p.first_fragment {
-        tc_bump(prog, tcev::NOT_FIRST_FRAGMENT);
+        tc_bump(prog, TcEv::NotFirstFragment);
         return true;
     }
     if net::l4_csum_offset(p.proto).is_none() {
@@ -126,30 +126,30 @@ pub fn port_in_range(
     let port_be: u16 = match ctx.load(p.l4 + port_off) {
         Ok(v) => v,
         Err(_) => {
-            tc_bump(prog, tcev::SHORT);
+            tc_bump(prog, TcEv::Short);
             return false;
         }
     };
     if !net::port_in_range(u16::from_be(port_be), cfg.port_lo, cfg.port_hi) {
-        tc_bump(prog, tcev::PORT_OUT_OF_RANGE);
+        tc_bump(prog, TcEv::PortOutOfRange);
         return false;
     }
     true
 }
 
 #[inline(always)]
-pub fn count_rewrite(prog: u32, proto: u8) {
+pub fn count_rewrite(prog: TcProg, proto: u8) {
     match proto {
-        net::IPPROTO_TCP => tc_bump(prog, tcev::REWRITTEN_TCP),
-        net::IPPROTO_UDP => tc_bump(prog, tcev::REWRITTEN_UDP),
-        _ => tc_bump(prog, tcev::REWRITTEN_OTHER),
+        net::IPPROTO_TCP => tc_bump(prog, TcEv::RewrittenTcp),
+        net::IPPROTO_UDP => tc_bump(prog, TcEv::RewrittenUdp),
+        _ => tc_bump(prog, TcEv::RewrittenOther),
     }
 }
 
 /// An Ethernet-framed device says so in the ethertype; an L3-only one has no such header, leaving
 /// the IP version nibble as the only source.
 #[inline(always)]
-fn is_ipv4(ctx: &TcContext, prog: u32, l3_offset: usize) -> bool {
+fn is_ipv4(ctx: &TcContext, prog: TcProg, l3_offset: usize) -> bool {
     let version_byte = if l3_offset >= net::ETH_HDR_LEN {
         let Ok(ethertype) = ctx.load::<u16>(net::ETH_TYPE_OFF) else {
             return false;
@@ -157,11 +157,11 @@ fn is_ipv4(ctx: &TcContext, prog: u32, l3_offset: usize) -> bool {
         match u16::from_be(ethertype) {
             net::ETH_P_IP => return true,
             net::ETH_P_IPV6 => {
-                tc_bump(prog, tcev::V6);
+                tc_bump(prog, TcEv::V6);
                 return false;
             }
             _ => {
-                tc_bump(prog, tcev::NOT_IP);
+                tc_bump(prog, TcEv::NotIp);
                 return false;
             }
         }
@@ -174,11 +174,11 @@ fn is_ipv4(ctx: &TcContext, prog: u32, l3_offset: usize) -> bool {
     match net::ip_version(version_byte) {
         4 => true,
         6 => {
-            tc_bump(prog, tcev::V6);
+            tc_bump(prog, TcEv::V6);
             false
         }
         _ => {
-            tc_bump(prog, tcev::NOT_IP);
+            tc_bump(prog, TcEv::NotIp);
             false
         }
     }
@@ -188,10 +188,10 @@ fn is_ipv4(ctx: &TcContext, prog: u32, l3_offset: usize) -> bool {
 #[inline(always)]
 pub fn run(
     ctx: &mut TcContext,
-    prog: u32,
+    prog: TcProg,
     f: fn(&mut TcContext, &SleeveConfig, usize) -> i32,
 ) -> i32 {
-    tc_bump(prog, tcev::TOTAL);
+    tc_bump(prog, TcEv::Total);
     let Some(cfg) = SLEEVE_CONFIG.get(0) else {
         return OK;
     };

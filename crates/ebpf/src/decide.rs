@@ -9,7 +9,7 @@
 //! unconnected UDP re-decides per datagram, a deliberate difference with a test asserting it.
 
 use aya_ebpf::{helpers::bpf_get_netns_cookie, programs::SockAddrContext, EbpfContext};
-use needlecast_common::{ev, net, Config, CONFIG_KEY};
+use needlecast_common::{net, Config, Ev, Prog, CONFIG_KEY};
 
 use crate::maps::{bump, CONFIG, DESKTOP_PORTS};
 use crate::sock::{
@@ -19,12 +19,12 @@ use crate::sock::{
 
 /// Everything before the socket lookup, which is the expensive part. `None` means decline.
 #[inline(always)]
-unsafe fn preflight(ctx: &SockAddrContext, prog: u32) -> Option<(Config, u16)> {
-    bump(prog, ev::TOTAL);
+unsafe fn preflight(ctx: &SockAddrContext, prog: Prog) -> Option<(Config, u16)> {
+    bump(prog, Ev::Total);
 
     let cfg = *CONFIG.get(CONFIG_KEY)?;
     if cfg.enabled == 0 {
-        bump(prog, ev::DISABLED);
+        bump(prog, Ev::Disabled);
         return None;
     }
 
@@ -33,21 +33,21 @@ unsafe fn preflight(ctx: &SockAddrContext, prog: u32) -> Option<(Config, u16)> {
     // tunnel address that does not exist there and sees ENETUNREACH instead of ECONNREFUSED.
     let cookie = bpf_get_netns_cookie(ctx.as_ptr());
     if cookie == 0 {
-        bump(prog, ev::NETNS_COOKIE_UNAVAILABLE);
+        bump(prog, Ev::NetnsCookieUnavailable);
     } else if cfg.netns_cookie != 0 && cookie != cfg.netns_cookie {
-        bump(prog, ev::WRONG_NETNS);
+        bump(prog, Ev::WrongNetns);
         return None;
     }
 
     let port = port_of(ctx.sock_addr);
     if !net::port_in_range(port, cfg.port_lo, cfg.port_hi) {
-        bump(prog, ev::PORT_OUT_OF_RANGE);
+        bump(prog, Ev::PortOutOfRange);
         return None;
     }
 
     // Latency only: the server refuses an unserved port correctly on its own.
     if cfg.use_listener_map != 0 && DESKTOP_PORTS.get(&port).is_none() {
-        bump(prog, ev::NOT_ADVERTISED);
+        bump(prog, Ev::NotAdvertised);
         return None;
     }
 
@@ -59,25 +59,25 @@ unsafe fn preflight(ctx: &SockAddrContext, prog: u32) -> Option<(Config, u16)> {
 ///
 /// TCP only: on a UDP socket this fails on every datagram and buries the real `setsockopt_err`.
 #[inline(always)]
-unsafe fn apply_syncnt(ctx: &SockAddrContext, prog: u32, cfg: &Config, proto: Proto) {
+unsafe fn apply_syncnt(ctx: &SockAddrContext, prog: Prog, cfg: &Config, proto: Proto) {
     if cfg.syncnt == 0 || proto != Proto::Tcp {
         return;
     }
     if set_int_sockopt(ctx.as_ptr(), SOL_TCP, TCP_SYNCNT, cfg.syncnt as i32) == 0 {
-        bump(prog, ev::SETSOCKOPT_OK);
+        bump(prog, Ev::SetsockoptOk);
     } else {
-        bump(prog, ev::SETSOCKOPT_ERR);
+        bump(prog, Ev::SetsockoptErr);
     }
 }
 
 #[inline(always)]
-pub unsafe fn decide_v4(ctx: &SockAddrContext, prog: u32, proto: Proto) -> i32 {
+pub unsafe fn decide_v4(ctx: &SockAddrContext, prog: Prog, proto: Proto) -> i32 {
     let sa = ctx.sock_addr;
     let daddr = (*sa).user_ip4;
     // First, so a destination that was never ours costs one comparison.
     if !net::is_loopback_v4(daddr) {
-        bump(prog, ev::TOTAL);
-        bump(prog, ev::NOT_LOOPBACK);
+        bump(prog, Ev::Total);
+        bump(prog, Ev::NotLoopback);
         return ALLOW;
     }
 
@@ -86,19 +86,19 @@ pub unsafe fn decide_v4(ctx: &SockAddrContext, prog: u32, proto: Proto) -> i32 {
     };
 
     if has_local_listener_v4(ctx.as_ptr(), daddr, port, proto) {
-        bump(prog, ev::LOCAL_LISTENER);
+        bump(prog, Ev::LocalListener);
         return ALLOW;
     }
 
     // The port is never translated, so the reverse programs need no per-connection state.
     (*sa).user_ip4 = cfg.target_v4;
     apply_syncnt(ctx, prog, &cfg, proto);
-    bump(prog, ev::REWRITTEN);
+    bump(prog, Ev::Rewritten);
     ALLOW
 }
 
 #[inline(always)]
-pub unsafe fn decide_v6(ctx: &SockAddrContext, prog: u32, proto: Proto) -> i32 {
+pub unsafe fn decide_v6(ctx: &SockAddrContext, prog: Prog, proto: Proto) -> i32 {
     let sa = ctx.sock_addr;
     let daddr = read_v6(sa);
 
@@ -108,8 +108,8 @@ pub unsafe fn decide_v6(ctx: &SockAddrContext, prog: u32, proto: Proto) -> i32 {
         None => net::is_loopback_v6(&daddr),
     };
     if !loopback {
-        bump(prog, ev::TOTAL);
-        bump(prog, ev::NOT_LOOPBACK);
+        bump(prog, Ev::Total);
+        bump(prog, Ev::NotLoopback);
         return ALLOW;
     }
 
@@ -120,7 +120,7 @@ pub unsafe fn decide_v6(ctx: &SockAddrContext, prog: u32, proto: Proto) -> i32 {
     // Answered by the v4 stack, so it needs the v4 lookup and target with the prefix preserved.
     if let Some(v4) = mapped {
         if has_local_listener_v4(ctx.as_ptr(), v4, port, proto) {
-            bump(prog, ev::LOCAL_LISTENER);
+            bump(prog, Ev::LocalListener);
             return ALLOW;
         }
         write_v6(sa, [daddr[0], daddr[1], daddr[2], cfg.target_v4]);
@@ -128,24 +128,24 @@ pub unsafe fn decide_v6(ctx: &SockAddrContext, prog: u32, proto: Proto) -> i32 {
         // not in `decide_v4`, so leaving it out would give exactly those programs the stock
         // two-minute hang.
         apply_syncnt(ctx, prog, &cfg, proto);
-        bump(prog, ev::REWRITTEN);
+        bump(prog, Ev::Rewritten);
         return ALLOW;
     }
 
     // Declining is the only safe answer with no v6 target: rewriting to the unspecified address
     // would send the connection nowhere while looking like it worked.
     if cfg.target_v6 == [0; 4] {
-        bump(prog, ev::NO_V6_TARGET);
+        bump(prog, Ev::NoV6Target);
         return ALLOW;
     }
 
     if has_local_listener_v6(ctx.as_ptr(), daddr, port, proto) {
-        bump(prog, ev::LOCAL_LISTENER);
+        bump(prog, Ev::LocalListener);
         return ALLOW;
     }
 
     write_v6(sa, cfg.target_v6);
     apply_syncnt(ctx, prog, &cfg, proto);
-    bump(prog, ev::REWRITTEN);
+    bump(prog, Ev::Rewritten);
     ALLOW
 }

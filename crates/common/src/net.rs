@@ -180,7 +180,10 @@ mod tests {
         assert_eq!(ihl_bytes(0x45), 20);
         assert_eq!(ihl_bytes(0x4f), 60, "15 words of options");
         assert_eq!(ip_version(0x60), 6);
-        assert!(ihl_bytes(0x44) < IPV4_MIN_HDR, "the parser must reject this");
+        assert!(
+            ihl_bytes(0x44) < IPV4_MIN_HDR,
+            "the parser must reject this"
+        );
     }
 
     #[test]

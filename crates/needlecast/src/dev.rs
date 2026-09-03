@@ -9,22 +9,17 @@ use anyhow::{Context, Result};
 use aya::maps::{Array, Map};
 use aya::programs::{CgroupAttachMode, CgroupSockAddr};
 use aya::EbpfLoader;
-use needlecast_common::{
-    counter_slot, ev, prog, tc, tc_counter_slot, tcev, EV_NAMES, PROG_NAMES, TCEV_NAMES,
-    TC_PROG_NAMES,
-};
+use needlecast_common::{all_counters, all_tc_counters};
 
 use crate::bpf;
 
 pub fn counters() -> Result<()> {
     let m = bpf::open_pinned(bpf::CLIENT_PIN_DIR, "COUNTERS", Map::Array)?;
     let map: Array<_, u64> = (&m).try_into()?;
-    for p in 0..prog::COUNT {
-        for e in 0..ev::COUNT {
-            let v = map.get(&counter_slot(p, e), 0).unwrap_or(0);
-            if v != 0 {
-                println!("{}.{}={}", PROG_NAMES[p as usize], EV_NAMES[e as usize], v);
-            }
+    for (p, e, slot) in all_counters() {
+        let v = map.get(&slot, 0).unwrap_or(0);
+        if v != 0 {
+            println!("{}.{}={}", p.as_str(), e.as_str(), v);
         }
     }
     Ok(())
@@ -33,15 +28,10 @@ pub fn counters() -> Result<()> {
 pub fn tc_counters() -> Result<()> {
     let m = bpf::open_pinned(bpf::SERVER_PIN_DIR, "TC_COUNTERS", Map::Array)?;
     let map: Array<_, u64> = (&m).try_into()?;
-    for p in 0..tc::COUNT {
-        for e in 0..tcev::COUNT {
-            let v = map.get(&tc_counter_slot(p, e), 0).unwrap_or(0);
-            if v != 0 {
-                println!(
-                    "{}.{}={}",
-                    TC_PROG_NAMES[p as usize], TCEV_NAMES[e as usize], v
-                );
-            }
+    for (p, e, slot) in all_tc_counters() {
+        let v = map.get(&slot, 0).unwrap_or(0);
+        if v != 0 {
+            println!("{}.{}={}", p.as_str(), e.as_str(), v);
         }
     }
     Ok(())

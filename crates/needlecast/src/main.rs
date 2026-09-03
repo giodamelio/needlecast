@@ -24,7 +24,6 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use needlecast_common::proto::DEFAULT_CONTROL_PORT;
-use needlecast_common::{ev, prog, tc, tcev, COUNTER_SLOTS, TC_COUNTER_SLOTS};
 
 use transport::DEFAULT_LISTEN_PORT;
 
@@ -190,9 +189,6 @@ fn main() -> Result<()> {
         Command::Harness(h) => harness::run(h),
     }
 }
-
-const _: () = assert!(COUNTER_SLOTS == prog::COUNT * ev::COUNT);
-const _: () = assert!(TC_COUNTER_SLOTS == tc::COUNT * tcev::COUNT);
 
 #[cfg(test)]
 mod tests {

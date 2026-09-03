@@ -3,16 +3,16 @@
 //! `127.0.0.1` as the source of both.
 
 use aya_ebpf::{macros::cgroup_sock_addr, programs::SockAddrContext};
-use needlecast_common::prog;
+use needlecast_common::Prog;
 
 use crate::restore::{restore_v4, restore_v6};
 
 #[cgroup_sock_addr(recvmsg4)]
 pub fn recvmsg4(ctx: SockAddrContext) -> i32 {
-    unsafe { restore_v4(&ctx, prog::RECVMSG4) }
+    unsafe { restore_v4(&ctx, Prog::Recvmsg4) }
 }
 
 #[cgroup_sock_addr(recvmsg6)]
 pub fn recvmsg6(ctx: SockAddrContext) -> i32 {
-    unsafe { restore_v6(&ctx, prog::RECVMSG6) }
+    unsafe { restore_v6(&ctx, Prog::Recvmsg6) }
 }

@@ -8,10 +8,7 @@ use std::time::SystemTime;
 
 use anyhow::Result;
 use aya::maps::{Array, Map};
-use needlecast_common::{
-    counter_slot, ev, prog, tc, tc_counter_slot, tcev, Config, SleeveConfig, EV_NAMES, PROG_NAMES,
-    TCEV_NAMES, TC_PROG_NAMES,
-};
+use needlecast_common::{all_counters, all_tc_counters, Config, SleeveConfig};
 
 use crate::bpf;
 use crate::control;
@@ -122,15 +119,7 @@ fn report_client(has_pins: bool) -> Result<()> {
     print_counters(
         bpf::CLIENT_PIN_DIR,
         "COUNTERS",
-        prog::COUNT,
-        ev::COUNT,
-        |p, e| {
-            (
-                PROG_NAMES[p as usize],
-                EV_NAMES[e as usize],
-                counter_slot(p, e),
-            )
-        },
+        all_counters().map(|(p, e, slot)| (p.as_str(), e.as_str(), slot)),
     );
     Ok(())
 }
@@ -168,15 +157,7 @@ fn report_server(has_pins: bool) -> Result<()> {
     print_counters(
         bpf::SERVER_PIN_DIR,
         "TC_COUNTERS",
-        tc::COUNT,
-        tcev::COUNT,
-        |p, e| {
-            (
-                TC_PROG_NAMES[p as usize],
-                TCEV_NAMES[e as usize],
-                tc_counter_slot(p, e),
-            )
-        },
+        all_tc_counters().map(|(p, e, slot)| (p.as_str(), e.as_str(), slot)),
     );
     Ok(())
 }
@@ -257,9 +238,7 @@ fn listener_ports() -> Vec<u16> {
 fn print_counters(
     dir: &str,
     name: &str,
-    progs: u32,
-    events: u32,
-    describe: impl Fn(u32, u32) -> (&'static str, &'static str, u32),
+    slots: impl Iterator<Item = (&'static str, &'static str, u32)>,
 ) {
     let Ok(m) = bpf::open_pinned(dir, name, Map::Array) else {
         return;
@@ -267,13 +246,10 @@ fn print_counters(
     let Ok(map) = TryInto::<Array<_, u64>>::try_into(&m) else {
         return;
     };
-    for p in 0..progs {
-        for e in 0..events {
-            let (prog_name, ev_name, slot) = describe(p, e);
-            let v = map.get(&slot, 0).unwrap_or(0);
-            if v != 0 {
-                println!("counter.{prog_name}.{ev_name}={v}");
-            }
+    for (prog_name, ev_name, slot) in slots {
+        let v = map.get(&slot, 0).unwrap_or(0);
+        if v != 0 {
+            println!("counter.{prog_name}.{ev_name}={v}");
         }
     }
 }

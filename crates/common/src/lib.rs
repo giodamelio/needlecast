@@ -33,72 +33,112 @@ unsafe impl aya::Pod for Config {}
 
 pub const CONFIG_KEY: u32 = 0;
 
-pub mod prog {
-    pub const CONNECT4: u32 = 0;
-    pub const CONNECT6: u32 = 1;
-    pub const GETPEERNAME4: u32 = 2;
-    pub const GETPEERNAME6: u32 = 3;
-    pub const SENDMSG4: u32 = 4;
-    pub const SENDMSG6: u32 = 5;
-    pub const RECVMSG4: u32 = 6;
-    pub const RECVMSG6: u32 = 7;
-    pub const COUNT: u32 = 8;
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prog {
+    Connect4 = 0,
+    Connect6 = 1,
+    Getpeername4 = 2,
+    Getpeername6 = 3,
+    Sendmsg4 = 4,
+    Sendmsg6 = 5,
+    Recvmsg4 = 6,
+    Recvmsg6 = 7,
 }
 
-pub mod ev {
-    pub const TOTAL: u32 = 0;
-    pub const DISABLED: u32 = 1;
-    pub const WRONG_NETNS: u32 = 2;
-    pub const NOT_LOOPBACK: u32 = 3;
-    pub const PORT_OUT_OF_RANGE: u32 = 4;
-    pub const LOCAL_LISTENER: u32 = 5;
-    pub const NOT_ADVERTISED: u32 = 6;
-    pub const REWRITTEN: u32 = 7;
-    pub const RESTORED: u32 = 8;
-    pub const SK_LOOKUP_ERR: u32 = 9;
-    pub const SETSOCKOPT_OK: u32 = 10;
-    pub const SETSOCKOPT_ERR: u32 = 11;
-    pub const NETNS_COOKIE_UNAVAILABLE: u32 = 12;
+impl Prog {
+    pub const ALL: &'static [Prog] = &[
+        Prog::Connect4,
+        Prog::Connect6,
+        Prog::Getpeername4,
+        Prog::Getpeername6,
+        Prog::Sendmsg4,
+        Prog::Sendmsg6,
+        Prog::Recvmsg4,
+        Prog::Recvmsg6,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Prog::Connect4 => "connect4",
+            Prog::Connect6 => "connect6",
+            Prog::Getpeername4 => "getpeername4",
+            Prog::Getpeername6 => "getpeername6",
+            Prog::Sendmsg4 => "sendmsg4",
+            Prog::Sendmsg6 => "sendmsg6",
+            Prog::Recvmsg4 => "recvmsg4",
+            Prog::Recvmsg6 => "recvmsg6",
+        }
+    }
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ev {
+    Total = 0,
+    Disabled = 1,
+    WrongNetns = 2,
+    NotLoopback = 3,
+    PortOutOfRange = 4,
+    LocalListener = 5,
+    NotAdvertised = 6,
+    Rewritten = 7,
+    Restored = 8,
+    SkLookupErr = 9,
+    SetsockoptOk = 10,
+    SetsockoptErr = 11,
+    NetnsCookieUnavailable = 12,
     /// IPv6 destination with no IPv6 tunnel address, so there is nowhere to send it.
-    pub const NO_V6_TARGET: u32 = 13;
-    pub const COUNT: u32 = 16;
+    NoV6Target = 13,
 }
 
-pub const COUNTER_SLOTS: u32 = prog::COUNT * ev::COUNT;
+impl Ev {
+    /// Counters are indexed `prog * STRIDE + ev`, so this is deliberately larger than `ALL.len()`:
+    /// a new event appended below must not shift every existing program's slots.
+    pub const STRIDE: u32 = 16;
 
-pub const fn counter_slot(prog: u32, ev: u32) -> u32 {
-    prog * ev::COUNT + ev
+    pub const ALL: &'static [Ev] = &[
+        Ev::Total,
+        Ev::Disabled,
+        Ev::WrongNetns,
+        Ev::NotLoopback,
+        Ev::PortOutOfRange,
+        Ev::LocalListener,
+        Ev::NotAdvertised,
+        Ev::Rewritten,
+        Ev::Restored,
+        Ev::SkLookupErr,
+        Ev::SetsockoptOk,
+        Ev::SetsockoptErr,
+        Ev::NetnsCookieUnavailable,
+        Ev::NoV6Target,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Ev::Total => "total",
+            Ev::Disabled => "disabled",
+            Ev::WrongNetns => "wrong_netns",
+            Ev::NotLoopback => "not_loopback",
+            Ev::PortOutOfRange => "port_out_of_range",
+            Ev::LocalListener => "local_listener",
+            Ev::NotAdvertised => "not_advertised",
+            Ev::Rewritten => "rewritten",
+            Ev::Restored => "restored",
+            Ev::SkLookupErr => "sk_lookup_err",
+            Ev::SetsockoptOk => "setsockopt_ok",
+            Ev::SetsockoptErr => "setsockopt_err",
+            Ev::NetnsCookieUnavailable => "netns_cookie_unavailable",
+            Ev::NoV6Target => "no_v6_target",
+        }
+    }
 }
 
-pub const EV_NAMES: [&str; ev::COUNT as usize] = [
-    "total",
-    "disabled",
-    "wrong_netns",
-    "not_loopback",
-    "port_out_of_range",
-    "local_listener",
-    "not_advertised",
-    "rewritten",
-    "restored",
-    "sk_lookup_err",
-    "setsockopt_ok",
-    "setsockopt_err",
-    "netns_cookie_unavailable",
-    "no_v6_target",
-    "-",
-    "-",
-];
+pub const COUNTER_SLOTS: u32 = Prog::ALL.len() as u32 * Ev::STRIDE;
 
-pub const PROG_NAMES: [&str; prog::COUNT as usize] = [
-    "connect4",
-    "connect6",
-    "getpeername4",
-    "getpeername6",
-    "sendmsg4",
-    "sendmsg6",
-    "recvmsg4",
-    "recvmsg6",
-];
+pub const fn counter_slot(prog: Prog, ev: Ev) -> u32 {
+    prog as u32 * Ev::STRIDE + ev as u32
+}
 
 /// Server-side configuration, shared with the tc programs.
 #[repr(C)]
@@ -124,61 +164,186 @@ pub struct SleeveConfig {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SleeveConfig {}
 
-pub mod tc {
-    pub const INGRESS: u32 = 0;
-    pub const EGRESS: u32 = 1;
-    pub const GETPEERNAME: u32 = 2;
-    /// Reserved: counters are indexed `prog * tcev::COUNT + ev`, so adding a program later would
-    /// reindex every existing one.
-    pub const GETPEERNAME6: u32 = 3;
-    pub const COUNT: u32 = 4;
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcProg {
+    Ingress = 0,
+    Egress = 1,
+    Getpeername = 2,
+    Getpeername6 = 3,
 }
 
-pub mod tcev {
-    pub const TOTAL: u32 = 0;
-    pub const NOT_IP: u32 = 1;
-    pub const SHORT: u32 = 2;
-    pub const WRONG_ADDR: u32 = 3;
-    pub const PORT_OUT_OF_RANGE: u32 = 4;
-    pub const NOT_FIRST_FRAGMENT: u32 = 5;
-    pub const REWRITTEN_TCP: u32 = 6;
-    pub const REWRITTEN_UDP: u32 = 7;
-    pub const REWRITTEN_OTHER: u32 = 8;
-    pub const CSUM_ERR: u32 = 9;
-    pub const STORE_ERR: u32 = 10;
-    pub const V6: u32 = 11;
-    pub const NO_SK: u32 = 14;
-    pub const COUNT: u32 = 16;
+impl TcProg {
+    pub const ALL: &'static [TcProg] = &[
+        TcProg::Ingress,
+        TcProg::Egress,
+        TcProg::Getpeername,
+        TcProg::Getpeername6,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TcProg::Ingress => "tc_ingress",
+            TcProg::Egress => "tc_egress",
+            TcProg::Getpeername => "sleeve_getpeername4",
+            TcProg::Getpeername6 => "sleeve_getpeername6",
+        }
+    }
 }
 
-pub const TC_COUNTER_SLOTS: u32 = tc::COUNT * tcev::COUNT;
-
-pub const fn tc_counter_slot(prog: u32, ev: u32) -> u32 {
-    prog * tcev::COUNT + ev
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcEv {
+    Total = 0,
+    NotIp = 1,
+    Short = 2,
+    WrongAddr = 3,
+    PortOutOfRange = 4,
+    NotFirstFragment = 5,
+    RewrittenTcp = 6,
+    RewrittenUdp = 7,
+    RewrittenOther = 8,
+    CsumErr = 9,
+    StoreErr = 10,
+    V6 = 11,
+    NoSk = 14,
 }
 
-pub const TCEV_NAMES: [&str; tcev::COUNT as usize] = [
-    "total",
-    "not_ip",
-    "short",
-    "wrong_addr",
-    "port_out_of_range",
-    "not_first_fragment",
-    "rewritten_tcp",
-    "rewritten_udp",
-    "rewritten_other",
-    "csum_err",
-    "store_err",
-    "v6",
-    "-",
-    "-",
-    "no_sk",
-    "-",
-];
+impl TcEv {
+    /// See [`Ev::STRIDE`]. `NoSk`'s discriminant is why this cannot be `ALL.len()`.
+    pub const STRIDE: u32 = 16;
 
-pub const TC_PROG_NAMES: [&str; tc::COUNT as usize] = [
-    "tc_ingress",
-    "tc_egress",
-    "sleeve_getpeername4",
-    "sleeve_getpeername6",
-];
+    pub const ALL: &'static [TcEv] = &[
+        TcEv::Total,
+        TcEv::NotIp,
+        TcEv::Short,
+        TcEv::WrongAddr,
+        TcEv::PortOutOfRange,
+        TcEv::NotFirstFragment,
+        TcEv::RewrittenTcp,
+        TcEv::RewrittenUdp,
+        TcEv::RewrittenOther,
+        TcEv::CsumErr,
+        TcEv::StoreErr,
+        TcEv::V6,
+        TcEv::NoSk,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            TcEv::Total => "total",
+            TcEv::NotIp => "not_ip",
+            TcEv::Short => "short",
+            TcEv::WrongAddr => "wrong_addr",
+            TcEv::PortOutOfRange => "port_out_of_range",
+            TcEv::NotFirstFragment => "not_first_fragment",
+            TcEv::RewrittenTcp => "rewritten_tcp",
+            TcEv::RewrittenUdp => "rewritten_udp",
+            TcEv::RewrittenOther => "rewritten_other",
+            TcEv::CsumErr => "csum_err",
+            TcEv::StoreErr => "store_err",
+            TcEv::V6 => "v6",
+            TcEv::NoSk => "no_sk",
+        }
+    }
+}
+
+pub const TC_COUNTER_SLOTS: u32 = TcProg::ALL.len() as u32 * TcEv::STRIDE;
+
+pub const fn tc_counter_slot(prog: TcProg, ev: TcEv) -> u32 {
+    prog as u32 * TcEv::STRIDE + ev as u32
+}
+
+/// Every counter a client-side dump should walk, paired with its slot.
+pub fn all_counters() -> impl Iterator<Item = (Prog, Ev, u32)> {
+    Prog::ALL
+        .iter()
+        .flat_map(|p| Ev::ALL.iter().map(move |e| (*p, *e, counter_slot(*p, *e))))
+}
+
+pub fn all_tc_counters() -> impl Iterator<Item = (TcProg, TcEv, u32)> {
+    TcProg::ALL.iter().flat_map(|p| {
+        TcEv::ALL
+            .iter()
+            .map(move |e| (*p, *e, tc_counter_slot(*p, *e)))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// An event discriminant at or past the stride lands in the next program's block, silently
+    /// corrupting both counters.
+    #[test]
+    fn every_event_fits_inside_the_stride() {
+        for ev in Ev::ALL {
+            assert!((*ev as u32) < Ev::STRIDE, "{ev:?} overflows its block");
+        }
+        for ev in TcEv::ALL {
+            assert!((*ev as u32) < TcEv::STRIDE, "{ev:?} overflows its block");
+        }
+    }
+
+    #[test]
+    fn every_slot_is_distinct_and_within_the_map() {
+        let mut seen = BTreeSet::new();
+        for p in Prog::ALL {
+            for e in Ev::ALL {
+                let slot = counter_slot(*p, *e);
+                assert!(slot < COUNTER_SLOTS, "{p:?}.{e:?} is past the map");
+                assert!(seen.insert(slot), "{p:?}.{e:?} collides at slot {slot}");
+            }
+        }
+
+        let mut seen = BTreeSet::new();
+        for p in TcProg::ALL {
+            for e in TcEv::ALL {
+                let slot = tc_counter_slot(*p, *e);
+                assert!(slot < TC_COUNTER_SLOTS, "{p:?}.{e:?} is past the map");
+                assert!(seen.insert(slot), "{p:?}.{e:?} collides at slot {slot}");
+            }
+        }
+    }
+
+    /// `ALL` is hand-written, so a variant added without extending it would silently never appear
+    /// in `status` output.
+    #[test]
+    fn all_lists_are_complete_and_free_of_duplicates() {
+        macro_rules! distinct {
+            ($all:expr) => {
+                assert_eq!(
+                    $all.iter()
+                        .map(|v| *v as u32)
+                        .collect::<BTreeSet<_>>()
+                        .len(),
+                    $all.len()
+                )
+            };
+        }
+        distinct!(Prog::ALL);
+        distinct!(Ev::ALL);
+        distinct!(TcProg::ALL);
+        distinct!(TcEv::ALL);
+
+        assert_eq!(Prog::ALL.last(), Some(&Prog::Recvmsg6));
+        assert_eq!(Ev::ALL.last(), Some(&Ev::NoV6Target));
+        assert_eq!(TcProg::ALL.last(), Some(&TcProg::Getpeername6));
+        assert_eq!(TcEv::ALL.last(), Some(&TcEv::NoSk));
+    }
+
+    #[test]
+    fn names_are_unique_so_status_output_is_unambiguous() {
+        let progs: BTreeSet<_> = Prog::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(progs.len(), Prog::ALL.len());
+        let evs: BTreeSet<_> = Ev::ALL.iter().map(|e| e.as_str()).collect();
+        assert_eq!(evs.len(), Ev::ALL.len());
+        let tc_progs: BTreeSet<_> = TcProg::ALL.iter().map(|p| p.as_str()).collect();
+        assert_eq!(tc_progs.len(), TcProg::ALL.len());
+        let tc_evs: BTreeSet<_> = TcEv::ALL.iter().map(|e| e.as_str()).collect();
+        assert_eq!(tc_evs.len(), TcEv::ALL.len());
+
+        assert!(!progs.iter().any(|n| n.is_empty() || *n == "-"));
+    }
+}
