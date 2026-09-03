@@ -56,43 +56,24 @@
         }/bin/nixos-test-driver";
       };
 
-      # Root shell on either demo machine, once `nix run .#demo` has booted them.
-      #
-      #     nix run .#demo-ssh -- client
-      #     nix run .#demo-ssh -- server curl -sf http://localhost:8080/hello.txt
-      #
-      # The key is nixpkgs' snakeoil test key, which lives in the store and is therefore
-      # world-readable — `ssh` refuses such a file, so this copies it to mode 600 first.
+      # See nix/demo-ssh.nu. Only the four values nix knows are generated here.
       demo-ssh = let
         demoSsh = (import ./tests/lib/scenarios.nix {inherit pkgs;}).demoSsh;
+        script = pkgs.writeTextFile {
+          name = "needlecast-demo-ssh";
+          executable = true;
+          text = ''
+            #!${pkgs.lib.getExe pkgs.nushell}
+            const SERVER_PORT = ${toString demoSsh.ports.server}
+            const CLIENT_PORT = ${toString demoSsh.ports.client}
+            const KEY_SOURCE = "${demoSsh.snakeOilPrivateKey}"
+            const SSH = "${pkgs.openssh}/bin/ssh"
+            ${builtins.readFile ./nix/demo-ssh.nu}
+          '';
+        };
       in {
         type = "app";
-        program = "${pkgs.writeShellScript "needlecast-demo-ssh" ''
-          set -eu
-          case "''${1-client}" in
-            server) port=${toString demoSsh.ports.server} ;;
-            client) port=${toString demoSsh.ports.client} ;;
-            *)
-              echo "usage: nix run .#demo-ssh -- [server|client] [command...]" >&2
-              exit 2
-              ;;
-          esac
-          shift || true
-
-          key=$(mktemp -t needlecast-demo-key.XXXXXX)
-          install -m600 ${demoSsh.snakeOilPrivateKey} "$key"
-          # The machines are thrown away with the driver, so pinning their host keys would only
-          # produce a warning to ignore on the next boot.
-          # `set -e` would abort on a failed connection and leak the key, so take the status
-          # explicitly.
-          rc=0
-          ${pkgs.openssh}/bin/ssh \
-            -i "$key" -o IdentitiesOnly=yes \
-            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-            -p "$port" root@localhost "$@" || rc=$?
-          rm -f "$key"
-          exit $rc
-        ''}";
+        program = "${script}";
       };
       default = needlecast;
     });
