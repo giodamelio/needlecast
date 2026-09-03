@@ -28,7 +28,17 @@ sha2 = "0.11"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 base64 = "0.23"
 defguard_wireguard_rs = "0.11"
-signal-hook = "0.4"
+# Current-thread runtime, no work stealing: one control connection and a handful of timers do not
+# need a scheduler, and every kernel-facing call here is synchronous anyway.
+tokio = { version = "1", default-features = false, features = [
+  "rt",
+  "net",
+  "time",
+  "signal",
+  "sync",
+  "macros",
+  "io-util",
+] }
 
 [dev-dependencies]
 serde_json = "1"

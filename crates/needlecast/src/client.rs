@@ -25,6 +25,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 const ENDPOINT_REFRESH: Duration = Duration::from_secs(300);
 
+/// How often the local network is re-examined. A poll because the snapshot is all `wake::Watch`
+/// has to compare; Phase C replaces the timer with a netlink socket and keeps the comparison.
+const WATCH_POLL: Duration = Duration::from_millis(250);
+
 pub struct Args {
     pub secret: PathBuf,
     pub peer: String,
@@ -33,25 +37,25 @@ pub struct Args {
     pub syncnt: u8,
 }
 
-pub fn run(a: Args) -> Result<()> {
+pub async fn run(a: Args) -> Result<()> {
     let identity = Identity::load(&a.secret, Role::Client)?;
-    let shutdown = Shutdown::install()?;
+    let mut shutdown = Shutdown::install()?;
 
     let endpoint = format!("{}:{}", a.peer, a.listen_port);
-    let mut tunnel = Tunnel::up(&identity, &endpoint, a.listen_port)?;
+    let mut tunnel = Tunnel::up(&identity, &endpoint, a.listen_port).await?;
 
     let bridge = Bridge::attach(tunnel.peer_addr(), a.syncnt)?;
     let control_addr = SocketAddr::from((tunnel.peer_addr(), a.control_port));
 
     let mut backoff = BACKOFF_MIN;
     let mut watch = wake::Watch::new();
-    while !shutdown.requested() {
+    loop {
         // A moved peer is one of the two reasons a reconnect would otherwise never succeed.
-        if let Err(e) = tunnel.refresh_endpoint() {
+        if let Err(e) = tunnel.refresh_endpoint().await {
             log::debug!("could not re-resolve {endpoint}: {e:#}");
         }
 
-        match session(&mut tunnel, control_addr, &shutdown, &mut watch) {
+        match session(&mut tunnel, control_addr, &mut shutdown, &mut watch).await {
             Ok(Ended::Shutdown) => break,
             Ok(Ended::PeerGone) => log::info!("control connection closed"),
             Err(e) => {
@@ -68,7 +72,7 @@ pub fn run(a: Args) -> Result<()> {
 
         bridge.disable();
 
-        shutdown.sleep(backoff);
+        shutdown.sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
         // The old connection is already dead, even though the socket does not know it yet.
         if let Some(reason) = watch.poll() {
@@ -88,13 +92,13 @@ enum Ended {
     Shutdown,
 }
 
-fn session(
+async fn session(
     tunnel: &mut Tunnel,
     addr: SocketAddr,
-    shutdown: &Shutdown,
+    shutdown: &mut Shutdown,
     watch: &mut wake::Watch,
 ) -> Result<Ended> {
-    let s = control::dial(addr)?;
+    let s = control::dial(addr).await?;
     log::info!(
         "connected to {addr}, it serves ports {}-{}",
         s.port_lo,
@@ -103,26 +107,29 @@ fn session(
     // The server is authoritative over what it exposes.
     bpf::set_port_range(s.port_lo, s.port_hi)?;
 
-    let mut stream = s.stream;
-    let mut reader = stream.try_clone()?;
+    let (reader, mut writer) = s.stream.into_split();
+    let mut frames = control::spawn_reader(reader);
 
     // Not enabled until the first listener snapshot, so the first connection after coming up is
     // decided on real information rather than an empty map.
     let mut ready = false;
     let mut heartbeat = control::Heartbeat::new(Instant::now());
-    let mut last_probe = Instant::now();
-    let mut last_resolve = Instant::now();
+    // Reads `/proc/net/tcp`, so it is on a timer rather than on every wakeup.
+    let mut probe = tokio::time::interval(control::PING_INTERVAL);
+    let mut resolve = tokio::time::interval(ENDPOINT_REFRESH);
+    let mut network = tokio::time::interval(WATCH_POLL);
+    resolve.reset();
 
     loop {
-        if shutdown.requested() {
-            let _ = wire::write(&mut stream, &Msg::Goodbye);
-            return Ok(Ended::Shutdown);
-        }
-
-        match wire::read(&mut reader) {
-            Ok(msg) => {
+        tokio::select! {
+            _ = shutdown.requested() => {
+                let _ = wire::write(&mut writer, &Msg::Goodbye).await;
+                return Ok(Ended::Shutdown);
+            }
+            frame = frames.recv() => {
+                let Some(msg) = frame else { return Ok(Ended::PeerGone) };
                 heartbeat.heard(Instant::now());
-                match msg {
+                match msg? {
                     Msg::Listeners { ports } => {
                         bpf::replace_listeners(&ports)?;
                         if !ready {
@@ -136,35 +143,32 @@ fn session(
                     _ => {}
                 }
             }
-            Err(e) if control::is_idle(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        // Re-checked at most once per second, since it reads `/proc/net/tcp`.
-        if last_probe.elapsed() >= control::PING_INTERVAL {
-            last_probe = Instant::now();
-            let was = heartbeat.interval();
-            heartbeat.set_active(!control::established_with(tunnel.peer_addr()).is_empty());
-            if heartbeat.interval() != was {
-                log::debug!("heartbeat now every {:?}", heartbeat.interval());
+            _ = probe.tick() => {
+                let was = heartbeat.interval();
+                heartbeat.set_active(!control::established_with(tunnel.peer_addr()).is_empty());
+                if heartbeat.interval() != was {
+                    log::debug!("heartbeat now every {:?}", heartbeat.interval());
+                }
             }
-        }
-
-        // On its own timer: gating it on having received something deadlocks two idle peers.
-        match heartbeat.tick(Instant::now()) {
-            control::Beat::Ping => wire::write(&mut stream, &Msg::Ping)?,
-            control::Beat::Expired => {
-                bail!("nothing heard within {:?}", heartbeat.deadline())
+            // On its own timer: gating it on having received something deadlocks two idle peers.
+            _ = tokio::time::sleep_until(heartbeat.next_wake().into()) => {
+                match heartbeat.tick(Instant::now()) {
+                    control::Beat::Ping => wire::write(&mut writer, &Msg::Ping).await?,
+                    control::Beat::Expired => {
+                        bail!("nothing heard within {:?}", heartbeat.deadline())
+                    }
+                    control::Beat::Wait => {}
+                }
             }
-            control::Beat::Wait => {}
-        }
-        if let Some(reason) = watch.poll() {
-            bail!("{}", reason.as_str());
-        }
-        if last_resolve.elapsed() >= ENDPOINT_REFRESH {
-            last_resolve = Instant::now();
-            if let Err(e) = tunnel.refresh_endpoint() {
-                log::debug!("periodic re-resolve failed: {e:#}");
+            _ = network.tick() => {
+                if let Some(reason) = watch.poll() {
+                    bail!("{}", reason.as_str());
+                }
+            }
+            _ = resolve.tick() => {
+                if let Err(e) = tunnel.refresh_endpoint().await {
+                    log::debug!("periodic re-resolve failed: {e:#}");
+                }
             }
         }
     }

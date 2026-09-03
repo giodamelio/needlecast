@@ -5,13 +5,16 @@ edition = "2021"
 
 [features]
 default = []
-user = ["dep:aya", "dep:serde", "dep:postcard"]
+user = ["dep:aya", "dep:serde", "dep:postcard", "dep:tokio"]
 
 [dev-dependencies]
 # So `cargo test -p needlecast-common` covers `proto`, which is behind the `user` feature.
 needlecast-common = { path = ".", features = ["user"] }
+tokio = { version = "1", features = ["macros", "rt"], default-features = false }
 
 [dependencies]
 aya = { version = "0.13", optional = true }
 serde = { version = "1", features = ["derive", "alloc"], default-features = false, optional = true }
 postcard = { version = "1", features = ["alloc"], default-features = false, optional = true }
+# Only the `AsyncRead`/`AsyncWrite` traits and their extension methods; the runtime lives upstairs.
+tokio = { version = "1", features = ["io-util"], default-features = false, optional = true }

@@ -3,7 +3,7 @@
 //! Nothing else on the machine is touched. The one sysctl — `route_localnet`, server only — lives
 //! in a directory the kernel creates and destroys with the interface, so it cannot outlive us.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use anyhow::{anyhow, Context, Result};
 use defguard_wireguard_rs::{
@@ -87,7 +87,7 @@ pub struct Tunnel {
 impl Tunnel {
     /// A leftover `needle` is replaced rather than adopted: the interface is ours alone, and a
     /// known-good one costs a single handshake where an inherited one costs unknown state.
-    pub fn up(identity: &Identity, peer_endpoint: &str, listen_port: u16) -> Result<Self> {
+    pub async fn up(identity: &Identity, peer_endpoint: &str, listen_port: u16) -> Result<Self> {
         let plan = Plan::for_role(identity.role);
         let mut api =
             WGApi::<Kernel>::new(IFACE.to_string()).context("opening the WireGuard netlink API")?;
@@ -112,7 +112,7 @@ impl Tunnel {
             listen_port,
         };
         // Not fatal: the interface is still worth having up so the peer can reach *us*.
-        if let Err(e) = tunnel.resolve() {
+        if let Err(e) = tunnel.resolve().await {
             log::warn!("could not resolve {peer_endpoint} yet: {e:#}");
         }
         tunnel.apply()?;
@@ -158,9 +158,9 @@ impl Tunnel {
 
     /// Returns whether the address changed. Call on every reconnect attempt while disconnected,
     /// and every few minutes while connected.
-    pub fn refresh_endpoint(&mut self) -> Result<bool> {
+    pub async fn refresh_endpoint(&mut self) -> Result<bool> {
         let previous = self.resolved;
-        self.resolve()?;
+        self.resolve().await?;
         if self.resolved == previous {
             return Ok(false);
         }
@@ -176,10 +176,11 @@ impl Tunnel {
         Ok(true)
     }
 
-    fn resolve(&mut self) -> Result<()> {
-        let addrs: Vec<SocketAddr> = self
-            .endpoint
-            .to_socket_addrs()
+    /// Resolution is async because a stalled DNS lookup on the single-threaded runtime would hold
+    /// up the heartbeat, and a missed heartbeat is a reconnect nothing was wrong with.
+    async fn resolve(&mut self) -> Result<()> {
+        let addrs: Vec<SocketAddr> = tokio::net::lookup_host(&self.endpoint)
+            .await
             .with_context(|| format!("resolving {}", self.endpoint))?
             .collect();
         self.resolved = Some(
@@ -328,7 +329,7 @@ mod tests {
             SocketAddr::from(("2001:db8::2".parse::<Ipv6Addr>().unwrap(), port))
         }
 
-            #[test]
+        #[test]
         fn the_a_record_wins_even_when_the_aaaa_comes_first() {
             assert_eq!(pick_endpoint(&[v6(47654), v4(47654)]), Some(v4(47654)));
             assert_eq!(pick_endpoint(&[v4(47654), v6(47654)]), Some(v4(47654)));

@@ -5,13 +5,16 @@
 //! is gone, and connections hang on SYN retransmit instead of failing.
 
 use std::collections::BTreeSet;
-use std::io::{self, ErrorKind, Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use tokio::net::tcp::OwnedReadHalf;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
+
 pub use needlecast_common::proto::EXIT_VERSION_MISMATCH;
-use needlecast_common::proto::{wire, Msg, MAGIC, VERSION};
+use needlecast_common::proto::{preamble, wire, Msg, VERSION};
 
 use crate::shutdown::Shutdown;
 
@@ -23,15 +26,16 @@ pub const IDLE_PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const LIVENESS_MULTIPLIER: u32 = 3;
 
 /// Must exceed the client's slowest liveness deadline, or an idle laptop is disconnected on a timer
-/// rather than because anything is wrong. Without it a suspended one holds a thread until TCP
+/// rather than because anything is wrong. Without it a suspended one holds a task until TCP
 /// keepalive notices, which takes two hours.
 pub const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Both sides act on their own timers, so a read returning empty has to be routine rather than
-/// fatal — which means this must stay well under any deadline.
-pub const POLL: Duration = Duration::from_millis(250);
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const LISTENER_POLL: Duration = Duration::from_millis(250);
+
+/// Deep enough that a burst cannot stall the reader, shallow enough that a stalled consumer is
+/// noticed rather than buffered indefinitely.
+const FRAME_QUEUE: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VersionMismatch {
@@ -52,50 +56,14 @@ impl std::fmt::Display for VersionMismatch {
 
 impl std::error::Error for VersionMismatch {}
 
-/// Nothing had arrived yet, as opposed to anything being wrong.
-pub fn is_idle(e: &io::Error) -> bool {
-    matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
-}
-
-fn write_preamble(w: &mut impl Write, version: u32) -> io::Result<()> {
-    w.write_all(&MAGIC)?;
-    w.write_all(&version.to_be_bytes())?;
-    w.flush()
-}
-
-/// Retries while the socket is merely idle, so [`POLL`] does not look like a failed handshake.
-fn read_preamble(r: &mut impl Read, deadline: Duration) -> Result<u32> {
-    let mut buf = [0u8; 8];
-    let mut got = 0;
-    let started = Instant::now();
-    while got < buf.len() {
-        match r.read(&mut buf[got..]) {
-            Ok(0) => anyhow::bail!("peer closed during the handshake"),
-            Ok(n) => got += n,
-            Err(e) if is_idle(&e) => {
-                if started.elapsed() >= deadline {
-                    anyhow::bail!("no handshake within {deadline:?}");
-                }
-            }
-            Err(e) => return Err(e).context("reading the handshake"),
-        }
-    }
-    if buf[..4] != MAGIC {
-        anyhow::bail!(
-            "not a needlecast peer: expected magic {:?}, got {:?}",
-            MAGIC,
-            &buf[..4]
-        );
-    }
-    Ok(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]))
-}
-
 /// Both sides send before either compares, so each can name the other's version in its error
 /// rather than reporting an unexplained disconnect.
-pub fn exchange_version(stream: &mut TcpStream, deadline: Duration) -> Result<()> {
-    write_preamble(stream, VERSION)?;
-    let mut reader = stream.try_clone()?;
-    let theirs = read_preamble(&mut reader, deadline)?;
+pub async fn exchange_version(stream: &mut TcpStream, deadline: Duration) -> Result<()> {
+    preamble::write(stream, VERSION).await?;
+    let theirs = tokio::time::timeout(deadline, preamble::read(stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("no handshake within {deadline:?}"))?
+        .context("reading the handshake")?;
     if theirs != VERSION {
         return Err(VersionMismatch {
             ours: VERSION,
@@ -104,6 +72,28 @@ pub fn exchange_version(stream: &mut TcpStream, deadline: Duration) -> Result<()
         .into());
     }
     Ok(())
+}
+
+/// Frames arrive on a channel rather than as a `select!` arm because [`wire::read`] is not
+/// cancellation-safe: a timer firing mid-frame would drop the bytes already consumed and leave the
+/// stream misaligned. The task is the only reader, so it is never cancelled.
+pub fn spawn_reader(mut half: OwnedReadHalf) -> mpsc::Receiver<std::io::Result<Msg>> {
+    let (tx, rx) = mpsc::channel(FRAME_QUEUE);
+    tokio::spawn(async move {
+        loop {
+            let frame = wire::read(&mut half).await;
+            let fatal = frame.is_err();
+            if tx.send(frame).await.is_err() || fatal {
+                return;
+            }
+        }
+    });
+    rx
+}
+
+/// The channel closing means the reader task ended, which only happens on EOF or a fatal error.
+fn peer_gone() -> anyhow::Error {
+    anyhow::anyhow!("the peer closed the control connection")
 }
 
 /// Ports reachable through this machine's own loopback, which includes wildcard binds.
@@ -186,86 +176,79 @@ fn parse_established(text: &str, peer: Ipv4Addr, want_state: u8) -> Vec<(u16, u1
 }
 
 /// Holds no state about the client, so one that vanishes needs no cleanup here.
-pub fn serve(
+pub async fn serve(
     bind: Ipv4Addr,
     port: u16,
     port_lo: u16,
     port_hi: u16,
-    shutdown: &Shutdown,
+    shutdown: &mut Shutdown,
 ) -> Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((bind, port)))
+        .await
         .with_context(|| format!("binding control port {bind}:{port}"))?;
-    listener.set_nonblocking(true)?;
     log::info!("control plane listening on {bind}:{port}");
 
-    while !shutdown.requested() {
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                std::thread::spawn(move || match serve_one(stream, port_lo, port_hi) {
-                    Ok(()) => log::info!("{peer}: control connection ended"),
-                    Err(e) => match e.downcast_ref::<VersionMismatch>() {
-                        // Fatal by design: no negotiation, no compatibility shim.
-                        Some(m) => {
-                            log::error!("{peer}: {m}");
-                            std::process::exit(EXIT_VERSION_MISMATCH);
-                        }
-                        None => log::info!("{peer}: control connection failed: {e:#}"),
-                    },
-                });
+    loop {
+        let (stream, peer) = tokio::select! {
+            _ = shutdown.requested() => return Ok(()),
+            accepted = listener.accept() => accepted.context("accepting a control connection")?,
+        };
+        tokio::spawn(async move {
+            match serve_one(stream, port_lo, port_hi).await {
+                Ok(()) => log::info!("{peer}: control connection ended"),
+                Err(e) => match e.downcast_ref::<VersionMismatch>() {
+                    // Fatal by design: no negotiation, no compatibility shim.
+                    Some(m) => {
+                        log::error!("{peer}: {m}");
+                        std::process::exit(EXIT_VERSION_MISMATCH);
+                    }
+                    None => log::info!("{peer}: control connection failed: {e:#}"),
+                },
             }
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock => shutdown.sleep(POLL),
-            Err(e) => return Err(e).context("accepting a control connection"),
-        }
+        });
     }
-    Ok(())
 }
 
-fn serve_one(mut stream: TcpStream, port_lo: u16, port_hi: u16) -> Result<()> {
+async fn serve_one(mut stream: TcpStream, port_lo: u16, port_hi: u16) -> Result<()> {
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(POLL))?;
-    exchange_version(&mut stream, CONNECT_TIMEOUT)?;
-    wire::write(&mut stream, &Msg::Welcome { port_lo, port_hi })?;
+    exchange_version(&mut stream, CONNECT_TIMEOUT).await?;
+
+    let (reader, mut writer) = stream.into_split();
+    wire::write(&mut writer, &Msg::Welcome { port_lo, port_hi }).await?;
+    let mut frames = spawn_reader(reader);
 
     let mut published: Option<BTreeSet<u16>> = None;
-    let mut reader = stream.try_clone()?;
     let mut last_heard = Instant::now();
-    let mut last_scan = Instant::now()
-        .checked_sub(LISTENER_POLL)
-        .unwrap_or_else(Instant::now);
+    // Fires immediately, so the first snapshot does not wait for a heartbeat round trip.
+    let mut scan = tokio::time::interval(LISTENER_POLL);
     loop {
-        // Before the read, so the first snapshot does not wait for a heartbeat round trip.
-        if last_scan.elapsed() >= LISTENER_POLL {
-            last_scan = Instant::now();
-            let now: BTreeSet<u16> = local_listeners()?
-                .into_iter()
-                .filter(|p| *p >= port_lo && *p <= port_hi)
-                .collect();
-            if published.as_ref() != Some(&now) {
-                wire::write(
-                    &mut stream,
-                    &Msg::Listeners {
-                        ports: now.iter().copied().collect(),
-                    },
-                )?;
-                published = Some(now);
+        tokio::select! {
+            _ = scan.tick() => {
+                let now: BTreeSet<u16> = local_listeners()?
+                    .into_iter()
+                    .filter(|p| *p >= port_lo && *p <= port_hi)
+                    .collect();
+                if published.as_ref() != Some(&now) {
+                    wire::write(
+                        &mut writer,
+                        &Msg::Listeners { ports: now.iter().copied().collect() },
+                    )
+                    .await?;
+                    published = Some(now);
+                }
             }
-        }
-
-        match wire::read(&mut reader) {
-            Ok(msg) => {
+            frame = frames.recv() => {
+                let msg = frame.ok_or_else(peer_gone)??;
                 last_heard = Instant::now();
                 match msg {
-                    Msg::Ping => wire::write(&mut stream, &Msg::Pong)?,
+                    Msg::Ping => wire::write(&mut writer, &Msg::Pong).await?,
                     Msg::Goodbye => return Ok(()),
                     _ => {}
                 }
             }
-            Err(e) if is_idle(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-
-        if last_heard.elapsed() >= SERVER_IDLE_TIMEOUT {
-            anyhow::bail!("silent for {SERVER_IDLE_TIMEOUT:?}, closing");
+            _ = tokio::time::sleep_until((last_heard + SERVER_IDLE_TIMEOUT).into()) => {
+                anyhow::bail!("silent for {SERVER_IDLE_TIMEOUT:?}, closing");
+            }
         }
     }
 }
@@ -316,6 +299,12 @@ impl Heartbeat {
         self.interval * LIVENESS_MULTIPLIER
     }
 
+    /// The earliest instant `tick` could return anything but [`Beat::Wait`], so a `select!` arm can
+    /// sleep exactly that long instead of waking on a poll interval to ask.
+    pub fn next_wake(&self) -> Instant {
+        (self.last_ping + self.interval).min(self.last_heard + self.deadline())
+    }
+
     pub fn tick(&mut self, now: Instant) -> Beat {
         if now.duration_since(self.last_heard) >= self.deadline() {
             return Beat::Expired;
@@ -336,13 +325,17 @@ pub struct Session {
 
 /// The caller owns the enabled flag: the order it is cleared in matters more than anything else
 /// here.
-pub fn dial(addr: SocketAddr) -> Result<Session> {
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+pub async fn dial(addr: SocketAddr) -> Result<Session> {
+    let mut stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        .await
+        .map_err(|_| anyhow::anyhow!("dialling {addr} timed out after {CONNECT_TIMEOUT:?}"))?
         .with_context(|| format!("dialling {addr}"))?;
     stream.set_nodelay(true)?;
-    stream.set_read_timeout(Some(POLL))?;
-    exchange_version(&mut stream, CONNECT_TIMEOUT)?;
-    match wire::read(&mut stream) {
+    exchange_version(&mut stream, CONNECT_TIMEOUT).await?;
+    match tokio::time::timeout(CONNECT_TIMEOUT, wire::read(&mut stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("no Welcome within {CONNECT_TIMEOUT:?}"))?
+    {
         Ok(Msg::Welcome { port_lo, port_hi }) => Ok(Session {
             stream,
             port_lo,
@@ -422,33 +415,6 @@ mod tests {
     }
 
     #[test]
-    fn the_preamble_is_eight_stable_bytes() {
-        let mut buf = Vec::new();
-        write_preamble(&mut buf, 1).unwrap();
-        assert_eq!(buf, b"NDLC\x00\x00\x00\x01");
-    }
-
-    #[test]
-    fn a_preamble_round_trips() {
-        let mut buf = Vec::new();
-        write_preamble(&mut buf, 7).unwrap();
-        assert_eq!(read_preamble(&mut buf.as_slice(), POLL).unwrap(), 7);
-    }
-
-    #[test]
-    fn a_foreign_peer_is_rejected_on_the_magic_rather_than_the_version() {
-        let buf = b"HTTP/1.1".to_vec();
-        let err = read_preamble(&mut buf.as_slice(), POLL).expect_err("rejected");
-        assert!(err.to_string().contains("not a needlecast peer"), "{err}");
-    }
-
-    #[test]
-    fn a_short_preamble_is_an_error_not_a_partial_version() {
-        let buf = b"NDLC\x00".to_vec();
-        assert!(read_preamble(&mut buf.as_slice(), POLL).is_err());
-    }
-
-    #[test]
     fn a_mismatch_names_both_versions() {
         let m = VersionMismatch { ours: 1, theirs: 4 };
         let s = m.to_string();
@@ -458,7 +424,7 @@ mod tests {
 
     #[test]
     fn the_timers_are_ordered_so_no_side_gives_up_first_by_accident() {
-        assert!(POLL < PING_INTERVAL);
+        assert!(LISTENER_POLL < PING_INTERVAL);
         assert!(PING_INTERVAL < IDLE_PING_INTERVAL);
         assert!(IDLE_PING_INTERVAL * LIVENESS_MULTIPLIER < SERVER_IDLE_TIMEOUT);
     }
@@ -560,6 +526,41 @@ mod tests {
             let mut hb = Heartbeat::new(t0);
             hb.set_active(true);
             assert_eq!(hb.tick(at(t0, 60)), Beat::Expired);
+        }
+
+        /// The loop sleeps until exactly this instant, so anything later than the true due time is
+        /// a ping that never gets sent.
+        #[test]
+        fn the_next_wake_is_the_earlier_of_the_ping_and_the_deadline() {
+            let t0 = Instant::now();
+            let mut hb = Heartbeat::new(t0);
+            assert_eq!(hb.next_wake(), at(t0, 30), "idle: the ping comes first");
+
+            hb.set_active(true);
+            assert_eq!(hb.next_wake(), at(t0, 1));
+
+            // Nothing heard since t0, so the deadline at t0+3 now arrives before the next ping.
+            hb.tick(at(t0, 1));
+            assert_eq!(hb.next_wake(), at(t0, 2), "the ping at t0+2");
+            hb.tick(at(t0, 2));
+            assert_eq!(hb.next_wake(), at(t0, 3), "the deadline");
+        }
+
+        /// Sleeping past the due instant is the failure that matters; waking early only costs a
+        /// `Beat::Wait`.
+        #[test]
+        fn nothing_becomes_due_before_the_next_wake() {
+            let t0 = Instant::now();
+            let mut hb = Heartbeat::new(t0);
+            hb.set_active(true);
+            hb.heard(at(t0, 5));
+            let wake = hb.next_wake();
+            assert_eq!(
+                hb.tick(wake - Duration::from_millis(1)),
+                Beat::Wait,
+                "something was due before the loop planned to wake"
+            );
+            assert_ne!(hb.tick(wake), Beat::Wait);
         }
     }
 }

@@ -29,15 +29,15 @@ pub struct Args {
     pub control_port: u16,
 }
 
-pub fn run(a: Args) -> Result<()> {
+pub async fn run(a: Args) -> Result<()> {
     if a.port_lo > a.port_hi {
         bail!("--port-lo must not exceed --port-hi");
     }
     let identity = Identity::load(&a.secret, Role::Server)?;
-    let shutdown = Shutdown::install()?;
+    let mut shutdown = Shutdown::install()?;
 
     let endpoint = format!("{}:{}", a.peer, a.listen_port);
-    let tunnel = Tunnel::up(&identity, &endpoint, a.listen_port)?;
+    let tunnel = Tunnel::up(&identity, &endpoint, a.listen_port).await?;
 
     let datapath = Datapath::attach(
         transport::IFACE,
@@ -59,8 +59,9 @@ pub fn run(a: Args) -> Result<()> {
         a.control_port,
         a.port_lo,
         a.port_hi,
-        &shutdown,
-    )?;
+        &mut shutdown,
+    )
+    .await?;
 
     drop(datapath);
     tunnel.down()

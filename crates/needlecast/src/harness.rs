@@ -57,8 +57,8 @@ pub enum Command {
     },
 }
 
-pub fn run(cmd: Command) -> Result<()> {
-    let shutdown = Shutdown::install()?;
+pub async fn run(cmd: Command) -> Result<()> {
+    let mut shutdown = Shutdown::install()?;
     match cmd {
         Command::Bridge {
             target_v4,
@@ -87,7 +87,7 @@ pub fn run(cmd: Command) -> Result<()> {
             if !use_listener_map {
                 crate::bpf::set_use_listener_map(0)?;
             }
-            hold(&shutdown);
+            hold(&mut shutdown).await;
             drop(bridge);
             Ok(())
         }
@@ -106,9 +106,10 @@ pub fn run(cmd: Command) -> Result<()> {
                 Datapath::attach(&iface, transport_v4, transport_peer_v4, port_lo, port_hi)?;
             match control_port {
                 Some(port) => {
-                    crate::control::serve(transport_v4, port, port_lo, port_hi, &shutdown)?
+                    crate::control::serve(transport_v4, port, port_lo, port_hi, &mut shutdown)
+                        .await?
                 }
-                None => hold(&shutdown),
+                None => hold(&mut shutdown).await,
             }
             drop(datapath);
             Ok(())
@@ -116,8 +117,7 @@ pub fn run(cmd: Command) -> Result<()> {
     }
 }
 
-fn hold(shutdown: &Shutdown) {
-    while !shutdown.requested() {
-        shutdown.sleep(std::time::Duration::from_secs(1));
-    }
+/// Stay attached until told to stop: the suite drives the machine, not this process.
+async fn hold(shutdown: &mut Shutdown) {
+    shutdown.requested().await;
 }

@@ -117,16 +117,24 @@ enum DevCommand {
     /// Every non-zero server counter.
     TcCounters,
     ShowConfig,
-    SetEnabled { value: u8 },
+    SetEnabled {
+        value: u8,
+    },
     /// Populate DESKTOP_PORTS.
-    Advertise { ports: Vec<u16> },
-    Withdraw { ports: Vec<u16> },
+    Advertise {
+        ports: Vec<u16>,
+    },
+    Withdraw {
+        ports: Vec<u16>,
+    },
     /// Print the ports this machine is serving, as the control plane would publish them.
     Listeners,
     /// Report the current network namespace cookie.
     NetnsCookie,
     /// Parse an object without touching the kernel. Defaults to the embedded one. Unprivileged.
-    VerifyObject { path: Option<PathBuf> },
+    VerifyObject {
+        path: Option<PathBuf>,
+    },
     /// Prove the embedded object is aligned, and that misalignment is what breaks the parser.
     /// Exits non-zero if either half does not hold.
     AlignmentCheck,
@@ -134,7 +142,10 @@ enum DevCommand {
     ProbeSyncnt,
 }
 
-fn main() -> Result<()> {
+/// Current-thread: one control connection and a few timers. A work-stealing scheduler would buy
+/// nothing and cost a thread pool.
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     match Cli::parse().command {
         Command::Server {
@@ -144,27 +155,33 @@ fn main() -> Result<()> {
             port_hi,
             listen_port,
             control_port,
-        } => server::run(server::Args {
-            secret,
-            peer,
-            port_lo,
-            port_hi,
-            listen_port,
-            control_port,
-        }),
+        } => {
+            server::run(server::Args {
+                secret,
+                peer,
+                port_lo,
+                port_hi,
+                listen_port,
+                control_port,
+            })
+            .await
+        }
         Command::Client {
             secret,
             peer,
             listen_port,
             control_port,
             syncnt,
-        } => client::run(client::Args {
-            secret,
-            peer,
-            listen_port,
-            control_port,
-            syncnt,
-        }),
+        } => {
+            client::run(client::Args {
+                secret,
+                peer,
+                listen_port,
+                control_port,
+                syncnt,
+            })
+            .await
+        }
         Command::Status { role } => status::report(role),
         Command::Keys { secret } => {
             let id = identity::Identity::load(&secret, identity::Role::Server)?;
@@ -186,7 +203,7 @@ fn main() -> Result<()> {
             DevCommand::ProbeSyncnt => dev::probe_syncnt(),
         },
         #[cfg(feature = "testing")]
-        Command::Harness(h) => harness::run(h),
+        Command::Harness(h) => harness::run(h).await,
     }
 }
 
