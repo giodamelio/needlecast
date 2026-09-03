@@ -81,8 +81,12 @@ fn clock(id: libc::clockid_t) -> Duration {
     Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
 }
 
+/// `CLOCK_MONOTONIC` is read first on purpose. The two reads are microseconds apart, and on a
+/// machine that has never suspended the gap is zero — so reading `CLOCK_BOOTTIME` first makes the
+/// subtraction underflow every time, and `saturating_sub` then reports zero forever.
 fn suspended_time() -> Duration {
-    clock(libc::CLOCK_BOOTTIME).saturating_sub(clock(libc::CLOCK_MONOTONIC))
+    let monotonic = clock(libc::CLOCK_MONOTONIC);
+    clock(libc::CLOCK_BOOTTIME).saturating_sub(monotonic)
 }
 
 /// `needle` and `lo` are excluded: a change we made ourselves is not news.
@@ -157,10 +161,24 @@ fn fingerprint_routes(text: &str) -> u64 {
 mod tests {
     use super::*;
 
-    /// Otherwise `saturating_sub` reports zero forever and resume detection silently stops.
+    /// Only holds in this order, which is why `suspended_time` reads them this way round.
     #[test]
-    fn boottime_is_never_behind_monotonic() {
-        assert!(clock(libc::CLOCK_BOOTTIME) >= clock(libc::CLOCK_MONOTONIC));
+    fn boottime_is_never_behind_monotonic_read_earlier() {
+        let monotonic = clock(libc::CLOCK_MONOTONIC);
+        assert!(clock(libc::CLOCK_BOOTTIME) >= monotonic);
+    }
+
+    /// `poll` compares consecutive readings, so a gap that drifts on its own is a resume reported
+    /// on a machine that never slept.
+    #[test]
+    fn the_suspend_gap_holds_still_while_the_machine_is_awake() {
+        let first = suspended_time();
+        std::thread::sleep(Duration::from_millis(50));
+        let second = suspended_time();
+        assert!(
+            second.abs_diff(first) < RESUME_THRESHOLD,
+            "gap drifted from {first:?} to {second:?}"
+        );
     }
 
     #[test]
