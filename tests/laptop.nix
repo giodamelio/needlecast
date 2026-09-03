@@ -92,14 +92,6 @@ in
               f"ss -ln {flag} | grep -q '{addr}:{port}'", timeout=30
           )
 
-      with subtest("the embedded object is aligned, and misalignment is what would break it"):
-          out = laptop.succeed("needlecast dev alignment-check")
-          print(out)
-          a = dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
-          assert a["align_32_offset"] == "0", a
-          assert a["aligned_parse"] == "ok", a
-          assert a["misaligned_parse"] == "failed", a
-
       with subtest("the embedded object parses"):
           print(laptop.succeed("needlecast dev verify-object"))
           print(laptop.succeed("mount | grep bpf || true"))

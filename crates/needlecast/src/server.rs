@@ -106,11 +106,11 @@ impl Datapath {
         port_lo: u16,
         port_hi: u16,
     ) -> Result<Self> {
-        bpf::reset_pin_dir(bpf::SERVER_PIN_DIR)?;
-        bpf::clear_ready(bpf::SERVER_READY_FILE);
+        bpf::Half::Server.reset_pins()?;
+        bpf::Half::Server.clear_ready();
 
         let l3_offset = bpf::l3_offset_for(iface)?;
-        let mut ebpf = bpf::load_object(bpf::SERVER_PIN_DIR)?;
+        let mut ebpf = bpf::load_object(&bpf::Half::Server.pin_dir())?;
 
         // clsact must exist before either direction can attach; it may already be there.
         let _ = aya::programs::tc::qdisc_add_clsact(iface);
@@ -151,14 +151,11 @@ impl Datapath {
             .try_into()?;
         cfg_map.set(0, config, 0)?;
 
-        bpf::write_ready(
-            bpf::SERVER_READY_FILE,
-            &format!(
-                "iface={iface}\nl3_offset={l3_offset}\ntransport={transport_v4}\n\
+        bpf::Half::Server.write_ready(&format!(
+            "iface={iface}\nl3_offset={l3_offset}\ntransport={transport_v4}\n\
                  peer={transport_peer_v4}\nports={port_lo}-{port_hi}\n\
                  attached=tc_ingress,tc_egress,sleeve_getpeername4\n"
-            ),
-        )?;
+        ))?;
         log::info!("datapath attached to {iface}, L3 offset {l3_offset}");
         println!("ready");
 

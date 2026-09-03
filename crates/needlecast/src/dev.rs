@@ -14,7 +14,7 @@ use needlecast_common::{all_counters, all_tc_counters};
 use crate::bpf;
 
 pub fn counters() -> Result<()> {
-    let m = bpf::open_pinned(bpf::CLIENT_PIN_DIR, "COUNTERS", Map::Array)?;
+    let m = bpf::Half::Client.open_map("COUNTERS", Map::Array)?;
     let map: Array<_, u64> = (&m).try_into()?;
     for (p, e, slot) in all_counters() {
         let v = map.get(&slot, 0).unwrap_or(0);
@@ -26,7 +26,7 @@ pub fn counters() -> Result<()> {
 }
 
 pub fn tc_counters() -> Result<()> {
-    let m = bpf::open_pinned(bpf::SERVER_PIN_DIR, "TC_COUNTERS", Map::Array)?;
+    let m = bpf::Half::Server.open_map("TC_COUNTERS", Map::Array)?;
     let map: Array<_, u64> = (&m).try_into()?;
     for (p, e, slot) in all_tc_counters() {
         let v = map.get(&slot, 0).unwrap_or(0);
@@ -57,7 +57,7 @@ pub fn set_enabled(value: u8) -> Result<()> {
 
 pub fn advertise(ports: &[u16], present: bool) -> Result<()> {
     use aya::maps::HashMap;
-    let mut m = bpf::open_pinned(bpf::CLIENT_PIN_DIR, "DESKTOP_PORTS", Map::HashMap)?;
+    let mut m = bpf::Half::Client.open_map("DESKTOP_PORTS", Map::HashMap)?;
     let mut map: HashMap<_, u16, u8> = (&mut m).try_into()?;
     for p in ports {
         if present {
@@ -101,52 +101,11 @@ pub fn verify_object(path: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-/// Demonstrates both halves of the claim: the embedded object parses, and the same bytes at a
-/// deliberately odd address do not. Without the second half, "we fixed it with alignment" is a
-/// story rather than a finding.
-pub fn alignment_check() -> Result<()> {
-    let addr = bpf::OBJECT.as_ptr() as usize;
-    println!("address={addr:#x}");
-    println!(
-        "align_{}_offset={}",
-        bpf::OBJECT_ALIGN,
-        addr % bpf::OBJECT_ALIGN
-    );
-    println!("align_8_offset={}", addr % 8);
-
-    bpf::assert_object_aligned()?;
-    aya_obj::Object::parse(bpf::OBJECT).context("aligned parse should succeed")?;
-    println!("aligned_parse=ok");
-
-    // A Vec's buffer is at least 8-aligned, so slicing one byte in is reliably odd.
-    let mut shifted = vec![0u8; bpf::OBJECT.len() + 1];
-    shifted[1..].copy_from_slice(bpf::OBJECT);
-    let misaligned = &shifted[1..];
-    println!(
-        "misaligned_align_8_offset={}",
-        misaligned.as_ptr() as usize % 8
-    );
-    match aya_obj::Object::parse(misaligned) {
-        Ok(_) => {
-            println!("misaligned_parse=ok");
-            anyhow::bail!(
-                "a misaligned slice parsed fine, so alignment is not what caused the \
-                 intermittent failure — the real cause is still unidentified"
-            );
-        }
-        Err(e) => {
-            println!("misaligned_parse=failed");
-            println!("misaligned_error={e:?}");
-        }
-    }
-    Ok(())
-}
-
 /// Loading this program on its own is the whole test: if the verifier rejects `bpf_setsockopt` in
 /// `cgroup_sock_addr` it fails here, rather than taking the other eight programs down with it.
 pub fn probe_syncnt() -> Result<()> {
     // Its own pin directory so the probe can run before, during, or after the loader.
-    let dir = format!("{}-probe", bpf::CLIENT_PIN_DIR);
+    let dir = format!("{}-probe", bpf::Half::Client.pin_dir());
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).context("creating probe pin directory")?;
     bpf::assert_object_aligned()?;

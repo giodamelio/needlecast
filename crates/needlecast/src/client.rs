@@ -239,15 +239,15 @@ impl Bridge {
     }
 
     pub fn attach_with(a: Attach) -> Result<Self> {
-        bpf::reset_pin_dir(bpf::CLIENT_PIN_DIR)?;
-        bpf::clear_ready(bpf::CLIENT_READY_FILE);
+        bpf::Half::Client.reset_pins()?;
+        bpf::Half::Client.clear_ready();
 
-        let mut ebpf = bpf::load_object(bpf::CLIENT_PIN_DIR)?;
+        let mut ebpf = bpf::load_object(&bpf::Half::Client.pin_dir())?;
         let cgroup = std::fs::File::open(bpf::CGROUP_ROOT)
             .with_context(|| format!("opening {}", bpf::CGROUP_ROOT))?;
 
-        let mut attached: Vec<&str> = bpf::CLIENT_PROGRAMS.to_vec();
-        for name in bpf::CLIENT_PROGRAMS {
+        let mut attached: Vec<&str> = bpf::Half::Client.programs().to_vec();
+        for name in bpf::Half::Client.programs() {
             bpf::attach_cgroup(&mut ebpf, name, &cgroup)
                 .with_context(|| format!("attaching {name}"))?;
         }
@@ -270,15 +270,12 @@ impl Bridge {
             .try_into()?;
         cfg_map.set(CONFIG_KEY, config, 0)?;
 
-        bpf::write_ready(
-            bpf::CLIENT_READY_FILE,
-            &format!(
-                "target={}\nnetns_cookie={netns_cookie}\nsyncnt={}\nattached={}\n",
-                a.target_v4,
-                a.syncnt,
-                attached.join(",")
-            ),
-        )?;
+        bpf::Half::Client.write_ready(&format!(
+            "target={}\nnetns_cookie={netns_cookie}\nsyncnt={}\nattached={}\n",
+            a.target_v4,
+            a.syncnt,
+            attached.join(",")
+        ))?;
         log::info!(
             "bridge attached: {} programs, netns cookie {netns_cookie}, target {}",
             attached.len(),

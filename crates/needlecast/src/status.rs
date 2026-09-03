@@ -56,8 +56,8 @@ fn which(role: StatusRole, client_state: bool, server_state: bool) -> (bool, boo
 }
 
 pub fn report(role: StatusRole) -> Result<()> {
-    let client_pins = std::path::Path::new(bpf::CLIENT_PIN_DIR).exists();
-    let server_pins = std::path::Path::new(bpf::SERVER_PIN_DIR).exists();
+    let client_pins = bpf::Half::Client.has_pins();
+    let server_pins = bpf::Half::Server.has_pins();
     let (show_client, show_server) = which(role, client_pins, server_pins);
 
     if !show_client && !show_server {
@@ -85,7 +85,7 @@ pub fn report(role: StatusRole) -> Result<()> {
 
 fn report_client(has_pins: bool) -> Result<()> {
     let config = read_client_config();
-    let loaded = any_program_loaded(bpf::CLIENT_PROGRAMS);
+    let loaded = any_program_loaded(bpf::Half::Client.programs());
     let state = classify(
         has_pins || transport::interface_exists(),
         loaded,
@@ -117,7 +117,7 @@ fn report_client(has_pins: bool) -> Result<()> {
         }
     }
     print_counters(
-        bpf::CLIENT_PIN_DIR,
+        bpf::Half::Client,
         "COUNTERS",
         all_counters().map(|(p, e, slot)| (p.as_str(), e.as_str(), slot)),
     );
@@ -131,7 +131,7 @@ fn report_server(has_pins: bool) -> Result<()> {
         "state={}",
         classify(
             has_pins || transport::interface_exists(),
-            any_program_loaded(bpf::SERVER_PROGRAMS),
+            any_program_loaded(bpf::Half::Server.programs()),
             config.as_ref().map(|c| c.enabled),
         )
         .as_str()
@@ -155,7 +155,7 @@ fn report_server(has_pins: bool) -> Result<()> {
         }
     }
     print_counters(
-        bpf::SERVER_PIN_DIR,
+        bpf::Half::Server,
         "TC_COUNTERS",
         all_tc_counters().map(|(p, e, slot)| (p.as_str(), e.as_str(), slot)),
     );
@@ -220,13 +220,15 @@ fn read_client_config() -> Option<Config> {
 }
 
 fn read_server_config() -> Option<SleeveConfig> {
-    let m = bpf::open_pinned(bpf::SERVER_PIN_DIR, "SLEEVE_CONFIG", Map::Array).ok()?;
+    let m = bpf::Half::Server
+        .open_map("SLEEVE_CONFIG", Map::Array)
+        .ok()?;
     let map: Array<_, SleeveConfig> = (&m).try_into().ok()?;
     map.get(&0, 0).ok()
 }
 
 fn listener_ports() -> Vec<u16> {
-    let Ok(m) = bpf::open_pinned(bpf::CLIENT_PIN_DIR, "DESKTOP_PORTS", Map::HashMap) else {
+    let Ok(m) = bpf::Half::Client.open_map("DESKTOP_PORTS", Map::HashMap) else {
         return Vec::new();
     };
     let Ok(map) = TryInto::<aya::maps::HashMap<_, u16, u8>>::try_into(&m) else {
@@ -236,11 +238,11 @@ fn listener_ports() -> Vec<u16> {
 }
 
 fn print_counters(
-    dir: &str,
+    half: bpf::Half,
     name: &str,
     slots: impl Iterator<Item = (&'static str, &'static str, u32)>,
 ) {
-    let Ok(m) = bpf::open_pinned(dir, name, Map::Array) else {
+    let Ok(m) = half.open_map(name, Map::Array) else {
         return;
     };
     let Ok(map) = TryInto::<Array<_, u64>>::try_into(&m) else {

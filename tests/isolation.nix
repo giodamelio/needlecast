@@ -100,14 +100,6 @@ in
               f"nc-probe connect --host 127.0.0.1 --port {port} {extra} 2>/dev/null || true"
           ))
 
-      with subtest("the embedded object is aligned, and misalignment is what would break it"):
-          out = laptop.succeed("needlecast dev alignment-check")
-          print(out)
-          a = dict(l.split("=", 1) for l in out.strip().splitlines() if "=" in l)
-          assert a["align_32_offset"] == "0", a
-          assert a["aligned_parse"] == "ok", a
-          assert a["misaligned_parse"] == "failed", a
-
       with subtest("set up the host side"):
           start_loader()
           laptop.succeed(

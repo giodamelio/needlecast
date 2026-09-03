@@ -50,23 +50,20 @@ impl Role {
     }
 }
 
-pub struct KeyPair {
-    pub private: [u8; 32],
-    pub public: [u8; 32],
-}
-
-impl KeyPair {
-    /// WireGuard's own encoding, so it compares directly against `wg show`.
-    pub fn public_base64(&self) -> String {
-        base64::engine::general_purpose::STANDARD.encode(self.public)
-    }
+/// WireGuard's own encoding, so it compares directly against `wg show`.
+pub fn public_base64(key: &[u8; 32]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(key)
 }
 
 /// No `Debug`: a stray `{:?}` would put a private key in a log.
+///
+/// The peer's private key is derivable from the same secret but is deliberately not kept: nothing
+/// needs it, and a key held in memory is a key that can leak.
 pub struct Identity {
     pub role: Role,
-    pub own: KeyPair,
-    pub peer: KeyPair,
+    pub private: [u8; 32],
+    pub public: [u8; 32],
+    pub peer_public: [u8; 32],
 }
 
 impl Identity {
@@ -76,15 +73,18 @@ impl Identity {
     }
 
     pub fn derive(secret: &[u8], role: Role) -> Self {
+        let (private, public) = keypair(secret, role);
         Identity {
             role,
-            own: keypair(secret, role),
-            peer: keypair(secret, role.peer()),
+            private,
+            public,
+            peer_public: keypair(secret, role.peer()).1,
         }
     }
 }
 
-fn keypair(secret: &[u8], role: Role) -> KeyPair {
+/// `(private, public)`.
+fn keypair(secret: &[u8], role: Role) -> ([u8; 32], [u8; 32]) {
     // No salt: the secret is already 32 bytes of real randomness, and any salt would have to come
     // from the same file anyway.
     let hk = Hkdf::<Sha256>::new(None, secret);
@@ -93,7 +93,7 @@ fn keypair(secret: &[u8], role: Role) -> KeyPair {
         .expect("32 bytes is a valid HKDF-SHA256 output length");
     // X25519 clamps on derivation, as WireGuard does, so this matches `wg pubkey` byte for byte.
     let public = PublicKey::from(&StaticSecret::from(private)).to_bytes();
-    KeyPair { private, public }
+    (private, public)
 }
 
 /// Trailing whitespace is trimmed so the `base64 > secret` recipe works whether or not the shell
@@ -142,8 +142,8 @@ mod tests {
     #[test]
     fn derivation_is_stable() {
         let id = Identity::derive(SECRET, Role::Server);
-        assert_eq!(id.own.public_base64(), SERVER_PUBLIC);
-        assert_eq!(id.peer.public_base64(), CLIENT_PUBLIC);
+        assert_eq!(public_base64(&id.public), SERVER_PUBLIC);
+        assert_eq!(public_base64(&id.peer_public), CLIENT_PUBLIC);
     }
 
     #[test]
@@ -151,23 +151,22 @@ mod tests {
         let server = Identity::derive(SECRET, Role::Server);
         let client = Identity::derive(SECRET, Role::Client);
 
-        assert_eq!(server.own.public, client.peer.public);
-        assert_eq!(client.own.public, server.peer.public);
-        assert_eq!(server.own.private, client.peer.private);
+        assert_eq!(server.public, client.peer_public);
+        assert_eq!(client.public, server.peer_public);
     }
 
     #[test]
     fn the_two_roles_get_different_keys() {
         let id = Identity::derive(SECRET, Role::Server);
-        assert_ne!(id.own.private, id.peer.private);
-        assert_ne!(id.own.public, id.peer.public);
+        assert_ne!(id.public, id.peer_public);
+        assert_ne!(id.private, id.peer_public);
     }
 
     #[test]
     fn a_different_secret_gives_different_keys() {
         let a = Identity::derive(b"one", Role::Server);
         let b = Identity::derive(b"two", Role::Server);
-        assert_ne!(a.own.public, b.own.public);
+        assert_ne!(a.public, b.public);
     }
 
     #[test]
@@ -186,7 +185,7 @@ mod tests {
             let trimmed = trim_trailing_ascii_whitespace(&padded);
             let derived = Identity::derive(trimmed, Role::Server);
             assert_eq!(
-                derived.own.public, bare.own.public,
+                derived.public, bare.public,
                 "a {suffix:?} suffix changed the key"
             );
         }
@@ -204,13 +203,13 @@ mod tests {
     #[test]
     fn public_key_is_wireguard_base64() {
         let id = Identity::derive(SECRET, Role::Client);
-        let encoded = id.own.public_base64();
+        let encoded = public_base64(&id.public);
         assert_eq!(encoded.len(), 44, "32 bytes base64 with padding");
         assert!(encoded.ends_with('='));
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(&encoded)
             .expect("round trips");
-        assert_eq!(decoded, id.own.public);
+        assert_eq!(decoded, id.public);
     }
 
     mod files {
@@ -248,8 +247,8 @@ mod tests {
             let path = write_secret(&dir, "secret", b"abcdefgh\n", 0o600);
             let id = Identity::load(&path, Role::Server).expect("loads");
             assert_eq!(
-                id.own.public,
-                Identity::derive(b"abcdefgh", Role::Server).own.public
+                id.public,
+                Identity::derive(b"abcdefgh", Role::Server).public
             );
             std::fs::remove_dir_all(&dir).unwrap();
         }

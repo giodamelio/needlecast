@@ -21,26 +21,82 @@ pub const OBJECT_ALIGN: usize = 32;
 
 pub const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 pub const RUN_DIR: &str = "/run/needlecast";
+const PIN_ROOT: &str = "/sys/fs/bpf/needlecast";
 
-pub const CLIENT_PIN_DIR: &str = "/sys/fs/bpf/needlecast/client";
-pub const CLIENT_READY_FILE: &str = "/run/needlecast/client.ready";
+/// Which end of the tunnel this process is, and everything that differs between the two. The paths
+/// are derived rather than written twice, so a half can never half-exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Half {
+    Client,
+    Server,
+}
 
-pub const SERVER_PIN_DIR: &str = "/sys/fs/bpf/needlecast/server";
-pub const SERVER_READY_FILE: &str = "/run/needlecast/server.ready";
+impl Half {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Half::Client => "client",
+            Half::Server => "server",
+        }
+    }
 
-/// Named so `status` can ask whether they are still loaded — the only honest liveness signal.
-pub const SERVER_PROGRAMS: &[&str] = &["tc_ingress", "tc_egress", "sleeve_getpeername4"];
+    pub fn pin_dir(self) -> String {
+        format!("{PIN_ROOT}/{}", self.as_str())
+    }
 
-pub const CLIENT_PROGRAMS: &[&str] = &[
-    "connect4",
-    "connect6",
-    "getpeername4",
-    "getpeername6",
-    "sendmsg4",
-    "sendmsg6",
-    "recvmsg4",
-    "recvmsg6",
-];
+    pub fn ready_file(self) -> String {
+        format!("{RUN_DIR}/{}.ready", self.as_str())
+    }
+
+    /// Named so `status` can ask whether they are still loaded — the only honest liveness signal.
+    pub const fn programs(self) -> &'static [&'static str] {
+        match self {
+            Half::Client => &[
+                "connect4",
+                "connect6",
+                "getpeername4",
+                "getpeername6",
+                "sendmsg4",
+                "sendmsg6",
+                "recvmsg4",
+                "recvmsg6",
+            ],
+            Half::Server => &["tc_ingress", "tc_egress", "sleeve_getpeername4"],
+        }
+    }
+
+    pub fn has_pins(self) -> bool {
+        Path::new(&self.pin_dir()).exists()
+    }
+
+    /// Stale pins would silently carry old counters and config forward.
+    pub fn reset_pins(self) -> Result<()> {
+        let dir = self.pin_dir();
+        if Path::new(&dir).exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("clearing stale pin directory {dir}"))?;
+        }
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating pin directory {dir}"))
+    }
+
+    pub fn open_map(self, name: &str, wrap: fn(MapData) -> Map) -> Result<Map> {
+        let path = Path::new(&self.pin_dir()).join(name);
+        let data = MapData::from_pin(&path)
+            .with_context(|| format!("opening pinned map {}", path.display()))?;
+        Ok(wrap(data))
+    }
+
+    /// Written only once every attach succeeded, so waiting on it means waiting on real readiness —
+    /// unlike the map pins, which appear during load and survive a crash.
+    pub fn write_ready(self, contents: &str) -> Result<()> {
+        std::fs::create_dir_all(RUN_DIR).with_context(|| format!("creating {RUN_DIR}"))?;
+        let path = self.ready_file();
+        std::fs::write(&path, contents).with_context(|| format!("writing {path}"))
+    }
+
+    pub fn clear_ready(self) {
+        let _ = std::fs::remove_file(self.ready_file());
+    }
+}
 
 /// Checked explicitly because the failure it prevents is intermittent and its error message points
 /// nowhere useful.
@@ -64,27 +120,6 @@ pub fn load_object(pin_dir: &str) -> Result<Ebpf> {
         .map_pin_path(pin_dir)
         .load(OBJECT)
         .map_err(|e| anyhow!("loading BPF object: {e:?}"))
-}
-
-/// Stale pins would silently carry old counters and config forward.
-pub fn reset_pin_dir(dir: &str) -> Result<()> {
-    if Path::new(dir).exists() {
-        std::fs::remove_dir_all(dir)
-            .with_context(|| format!("clearing stale pin directory {dir}"))?;
-    }
-    std::fs::create_dir_all(dir).with_context(|| format!("creating pin directory {dir}"))?;
-    Ok(())
-}
-
-/// Written only once every attach succeeded, so waiting on it means waiting on real readiness —
-/// unlike the map pins, which appear during load and survive a crash.
-pub fn write_ready(path: &str, contents: &str) -> Result<()> {
-    std::fs::create_dir_all(RUN_DIR).with_context(|| format!("creating {RUN_DIR}"))?;
-    std::fs::write(path, contents).with_context(|| format!("writing {path}"))
-}
-
-pub fn clear_ready(path: &str) {
-    let _ = std::fs::remove_file(path);
 }
 
 pub fn attach_cgroup(ebpf: &mut Ebpf, name: &str, cgroup: &std::fs::File) -> Result<()> {
@@ -173,15 +208,8 @@ pub fn v6_words(addr: std::net::Ipv6Addr) -> [u32; 4] {
     w
 }
 
-pub fn open_pinned(dir: &str, name: &str, wrap: fn(MapData) -> Map) -> Result<Map> {
-    let path = Path::new(dir).join(name);
-    let data = MapData::from_pin(&path)
-        .with_context(|| format!("opening pinned map {}", path.display()))?;
-    Ok(wrap(data))
-}
-
 pub fn read_config() -> Result<Config> {
-    let m = open_pinned(CLIENT_PIN_DIR, "CONFIG", Map::Array)?;
+    let m = Half::Client.open_map("CONFIG", Map::Array)?;
     let map: Array<_, Config> = (&m).try_into()?;
     Ok(map.get(&CONFIG_KEY, 0)?)
 }
@@ -203,7 +231,7 @@ pub fn set_port_range(port_lo: u16, port_hi: u16) -> Result<()> {
 }
 
 fn update_config(f: impl FnOnce(&mut Config)) -> Result<()> {
-    let mut m = open_pinned(CLIENT_PIN_DIR, "CONFIG", Map::Array)?;
+    let mut m = Half::Client.open_map("CONFIG", Map::Array)?;
     let mut map: Array<_, Config> = (&mut m).try_into()?;
     let mut c = map.get(&CONFIG_KEY, 0)?;
     f(&mut c);
@@ -213,7 +241,7 @@ fn update_config(f: impl FnOnce(&mut Config)) -> Result<()> {
 
 /// Whole set rather than a delta, so a dropped update cannot leave the two sides disagreeing.
 pub fn replace_listeners(ports: &[u16]) -> Result<()> {
-    let mut m = open_pinned(CLIENT_PIN_DIR, "DESKTOP_PORTS", Map::HashMap)?;
+    let mut m = Half::Client.open_map("DESKTOP_PORTS", Map::HashMap)?;
     let mut map: HashMap<_, u16, u8> = (&mut m).try_into()?;
     let existing: Vec<u16> = map.keys().filter_map(|k| k.ok()).collect();
     for k in existing {
@@ -261,31 +289,34 @@ mod tests {
         assert_ne!(v6_words(std::net::Ipv6Addr::LOCALHOST), [0; 4]);
     }
 
+    /// The two halves never run on the same machine, but they do share a build, and a shared path
+    /// would have one clobbering the other's pins on a machine running both for a test.
     #[test]
-    fn the_two_pin_directories_are_distinct() {
-        assert_ne!(CLIENT_PIN_DIR, SERVER_PIN_DIR);
-        assert_ne!(CLIENT_READY_FILE, SERVER_READY_FILE);
+    fn the_two_halves_share_no_paths() {
+        assert_ne!(Half::Client.pin_dir(), Half::Server.pin_dir());
+        assert_ne!(Half::Client.ready_file(), Half::Server.ready_file());
+        assert!(Half::Client.pin_dir().starts_with(PIN_ROOT));
+        assert!(Half::Server.ready_file().starts_with(RUN_DIR));
     }
 
     #[test]
-    fn every_client_program_is_present_in_the_embedded_object() {
+    fn every_program_each_half_attaches_is_present_in_the_embedded_object() {
         let obj = aya_obj::Object::parse(OBJECT).expect("the embedded object parses");
-        for name in CLIENT_PROGRAMS {
-            assert!(
-                obj.programs.contains_key(*name),
-                "{name} is missing from the object"
-            );
+        for half in [Half::Client, Half::Server] {
+            for name in half.programs() {
+                assert!(
+                    obj.programs.contains_key(*name),
+                    "{name} is missing from the object"
+                );
+            }
         }
     }
 
+    /// A program listed under both halves would be attached twice on a machine running both.
     #[test]
-    fn every_server_program_is_present_in_the_embedded_object() {
-        let obj = aya_obj::Object::parse(OBJECT).expect("the embedded object parses");
-        for name in SERVER_PROGRAMS {
-            assert!(
-                obj.programs.contains_key(*name),
-                "{name} is missing from the object"
-            );
+    fn the_halves_attach_disjoint_programs() {
+        for name in Half::Client.programs() {
+            assert!(!Half::Server.programs().contains(name), "{name}");
         }
     }
 

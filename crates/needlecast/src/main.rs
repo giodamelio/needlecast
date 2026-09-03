@@ -135,9 +135,6 @@ enum DevCommand {
     VerifyObject {
         path: Option<PathBuf>,
     },
-    /// Prove the embedded object is aligned, and that misalignment is what breaks the parser.
-    /// Exits non-zero if either half does not hold.
-    AlignmentCheck,
     /// Load and attach only the setsockopt probe. Exits non-zero if the verifier rejected it.
     ProbeSyncnt,
 }
@@ -185,8 +182,8 @@ async fn main() -> Result<()> {
         Command::Status { role } => status::report(role),
         Command::Keys { secret } => {
             let id = identity::Identity::load(&secret, identity::Role::Server)?;
-            println!("server {}", id.own.public_base64());
-            println!("client {}", id.peer.public_base64());
+            println!("server {}", identity::public_base64(&id.public));
+            println!("client {}", identity::public_base64(&id.peer_public));
             Ok(())
         }
         Command::Dev(d) => match d {
@@ -199,7 +196,6 @@ async fn main() -> Result<()> {
             DevCommand::Listeners => dev::listeners(),
             DevCommand::NetnsCookie => dev::netns_cookie(),
             DevCommand::VerifyObject { path } => dev::verify_object(path),
-            DevCommand::AlignmentCheck => dev::alignment_check(),
             DevCommand::ProbeSyncnt => dev::probe_syncnt(),
         },
         #[cfg(feature = "testing")]

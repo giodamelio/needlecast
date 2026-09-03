@@ -597,25 +597,19 @@ and needs it aligned. Whether that works depends on where the linker put the arr
 Aya ships `include_bytes_aligned!` for precisely this, wrapping the bytes in a `repr(align(32))`
 struct.
 
-**This is no longer intermittent, and that claim is tested rather than argued.**
-`needlecast dev alignment-check` proves both halves:
+The cause was confirmed at the time by copying the same bytes to a deliberately odd address and
+reproducing the *exact* error, which is what turned "we added alignment and it stopped failing"
+into an identified cause:
 
 ```
-align_32_offset=0
-aligned_parse=ok
-misaligned_align_8_offset=1
 misaligned_parse=failed
 misaligned_error=ElfError(Error("Invalid ELF header size or alignment"))
 ```
 
-The misaligned half matters as much as the aligned half: it reproduces the *exact* error from the
-original failure by copying the same bytes to an odd address, which is what turns "we added
-alignment and it stopped failing" into an identified cause. If a misaligned slice ever parses fine,
-the command exits non-zero saying the real cause is still unidentified, so it cannot bless a wrong
-diagnosis.
-
-Two guards keep it from returning quietly: `assert_object_aligned()` runs before every load, and
-both single-node suites assert all three outcomes on both kernels.
+That demonstration was a `dev` subcommand and two VM subtests. It is gone: it re-proved a property
+of the `object` crate on every run rather than anything about needlecast. What remains is the guard
+that matters — `assert_object_aligned()` runs before every load, and a unit test asserts the
+embedded object is aligned.
 
 The error is hard to diagnose because `EbpfError`'s Display collapses
 `ElfError(object::read::Error)` to `error parsing ELF data` — the inner cause is invisible because
