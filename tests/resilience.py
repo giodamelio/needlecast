@@ -104,6 +104,28 @@ with subtest("the client re-resolves a peer whose address changed"):
     assert real in ep, ep
     assert local(client, PORT).get("data") == "server-side"
 
+# The netlink monitor replaced a per-tick snapshot comparison. What it buys is reacting to a
+# local change immediately rather than at the end of a backoff that can be five seconds long.
+with subtest("a local address change is noticed without waiting out the backoff"):
+    server.succeed("systemctl stop ncserver.service")
+    client.wait_until_succeeds(
+        "needlecast dev show-config | grep -q 'enabled=0'", timeout=60
+    )
+    # Let the backoff grow to its maximum, so a reconnect that follows the address change cannot
+    # be confused with one that was due anyway.
+    client.succeed("sleep 12")
+    client.succeed("systemctl reset-failed ncserver.service || true")
+
+    start_server(server, peer="client")
+    client.succeed("ip link add nc-probe-dummy type dummy")
+    client.succeed("ip addr add 203.0.113.7/32 dev nc-probe-dummy")
+    client.succeed("ip link set nc-probe-dummy up")
+    wait_enabled(client)
+    journal = client.succeed("journalctl -u ncclient.service --no-pager | tail -30")
+    print(journal)
+    assert "local address changed" in journal, "netlink did not report the address change"
+    client.succeed("ip link del nc-probe-dummy")
+
 # Otherwise a suspended laptop holds a thread until TCP keepalive notices, in two hours.
 with subtest("the server reaps a client that stopped speaking"):
     before = int(server.succeed(

@@ -148,21 +148,48 @@ pub struct SleeveConfig {
     pub transport_peer_v4: u32,
     /// Where inbound packets are delivered, and what the peer is reported as.
     pub local_v4: u32,
-    /// Unused while the server datapath is IPv4-only, so adding v6 is new code rather than a layout
-    /// change to a struct BPF and userspace both depend on.
+    /// All-zero means the v6 datapath is off, and the tc programs pass IPv6 through.
     pub transport_v6: [u32; 4],
     pub transport_peer_v6: [u32; 4],
     pub local_v6: [u32; 4],
+    /// Where an inbound v6 packet is redirected. `ip6_rcv_core` drops a loopback destination on any
+    /// device that is not itself loopback, so unlike v4 there is nowhere else to deliver it.
+    pub lo_ifindex: u32,
     pub port_lo: u16,
     pub port_hi: u16,
     /// 14 on an Ethernet-framed device, 0 on an L3-only one.
     pub l3_offset: u16,
     pub enabled: u8,
-    pub _pad: u8,
+    /// Zero ends v6 ingress with `TC_ACT_OK` instead of handing the packet to `lo`. The product
+    /// always sets it; the harness can clear it, so the suite measures that the redirect is what
+    /// makes v6 delivery work rather than assuming it.
+    pub v6_redirect: u8,
 }
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for SleeveConfig {}
+
+/// What the listener feed needs to decide whether a socket event is worth waking userspace for.
+///
+/// The offsets locate `oldstate`, `newstate` and `sport` inside a `sock/inet_sock_set_state`
+/// record. They are read from the tracepoint's own `format` file at load time rather than written
+/// here: the layout has been stable for years but is not ABI, and a wrong offset would quietly
+/// stop the feed rather than fail loudly.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FeedConfig {
+    pub oldstate_off: u32,
+    pub newstate_off: u32,
+    pub sport_off: u32,
+    pub port_lo: u16,
+    pub port_hi: u16,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for FeedConfig {}
+
+/// `TCP_LISTEN`, from `include/net/tcp_states.h`. The one transition the feed cares about.
+pub const TCP_LISTEN: i32 = 10;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,6 +198,9 @@ pub enum TcProg {
     Egress = 1,
     Getpeername = 2,
     Getpeername6 = 3,
+    /// Not a datapath program, but it shares the counter map so `status` reports it beside the
+    /// rest — and so "the feed is silent while nothing changes" is assertable.
+    Feed = 4,
 }
 
 impl TcProg {
@@ -179,6 +209,7 @@ impl TcProg {
         TcProg::Egress,
         TcProg::Getpeername,
         TcProg::Getpeername6,
+        TcProg::Feed,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -187,6 +218,7 @@ impl TcProg {
             TcProg::Egress => "tc_egress",
             TcProg::Getpeername => "sleeve_getpeername4",
             TcProg::Getpeername6 => "sleeve_getpeername6",
+            TcProg::Feed => "listener_feed",
         }
     }
 }
@@ -205,8 +237,15 @@ pub enum TcEv {
     RewrittenOther = 8,
     CsumErr = 9,
     StoreErr = 10,
+    /// IPv6 seen while no v6 target is configured, so it was passed through untouched.
     V6 = 11,
+    /// An extension header chain this parser does not walk.
+    V6ExtHdr = 12,
+    /// `bpf_skb_change_head` or `bpf_redirect` refused; the packet is dropped rather than delivered
+    /// somewhere it was never addressed.
+    RedirectErr = 13,
     NoSk = 14,
+    Redirected = 15,
 }
 
 impl TcEv {
@@ -226,7 +265,10 @@ impl TcEv {
         TcEv::CsumErr,
         TcEv::StoreErr,
         TcEv::V6,
+        TcEv::V6ExtHdr,
+        TcEv::RedirectErr,
         TcEv::NoSk,
+        TcEv::Redirected,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -243,7 +285,10 @@ impl TcEv {
             TcEv::CsumErr => "csum_err",
             TcEv::StoreErr => "store_err",
             TcEv::V6 => "v6",
+            TcEv::V6ExtHdr => "v6_ext_hdr",
+            TcEv::RedirectErr => "redirect_err",
             TcEv::NoSk => "no_sk",
+            TcEv::Redirected => "redirected",
         }
     }
 }
@@ -329,8 +374,8 @@ mod tests {
 
         assert_eq!(Prog::ALL.last(), Some(&Prog::Recvmsg6));
         assert_eq!(Ev::ALL.last(), Some(&Ev::NoV6Target));
-        assert_eq!(TcProg::ALL.last(), Some(&TcProg::Getpeername6));
-        assert_eq!(TcEv::ALL.last(), Some(&TcEv::NoSk));
+        assert_eq!(TcProg::ALL.last(), Some(&TcProg::Feed));
+        assert_eq!(TcEv::ALL.last(), Some(&TcEv::Redirected));
     }
 
     #[test]

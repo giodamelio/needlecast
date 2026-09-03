@@ -22,9 +22,11 @@ pub const IFACE: &str = "needle";
 pub const SERVER_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 pub const CLIENT_V4: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 2);
 
-/// A `/24` on the interface for the on-link route; a `/32` of `allowed-ips` for the peer.
+/// A `/24` on the interface for the on-link route; a `/32` of `allowed-ips` for the peer. The v6
+/// side is the derived `/48`, with the peer pinned to its single address.
 const PREFIX_V4: u8 = 24;
 const PEER_PREFIX_V4: u8 = 32;
+const PREFIX_V6: u8 = 48;
 
 const MTU: u32 = 1420;
 
@@ -34,8 +36,8 @@ pub const DEFAULT_LISTEN_PORT: u16 = 47654;
 /// Client only: the server has the stable address, so holding the NAT hole open is our job.
 const KEEPALIVE_SECS: u16 = 25;
 
-/// The v6 halves are `None` until the server datapath speaks v6; the shape is here so that arrives
-/// as new code rather than a change to everything that reads a plan.
+/// The v6 halves are `None` only where no secret is available to derive them from, which is the
+/// unit tests and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Plan {
     pub own_v4: Ipv4Addr,
@@ -58,8 +60,22 @@ impl Plan {
         }
     }
 
-    fn own_address(&self) -> IpAddrMask {
-        IpAddrMask::new(IpAddr::V4(self.own_v4), PREFIX_V4)
+    /// The ULA comes from the shared secret, so both machines compute the same `/48` with nothing
+    /// to configure and no chance of two pairs colliding.
+    pub fn for_identity(identity: &Identity) -> Self {
+        Plan {
+            own_v6: Some(identity.own_v6),
+            peer_v6: Some(identity.peer_v6),
+            ..Plan::for_role(identity.role)
+        }
+    }
+
+    fn own_addresses(&self) -> Vec<IpAddrMask> {
+        let mut addrs = vec![IpAddrMask::new(IpAddr::V4(self.own_v4), PREFIX_V4)];
+        if let Some(v6) = self.own_v6 {
+            addrs.push(IpAddrMask::new(IpAddr::V6(v6), PREFIX_V6));
+        }
+        addrs
     }
 
     fn peer_allowed_ips(&self) -> Vec<IpAddrMask> {
@@ -88,7 +104,7 @@ impl Tunnel {
     /// A leftover `needle` is replaced rather than adopted: the interface is ours alone, and a
     /// known-good one costs a single handshake where an inherited one costs unknown state.
     pub async fn up(identity: &Identity, peer_endpoint: &str, listen_port: u16) -> Result<Self> {
-        let plan = Plan::for_role(identity.role);
+        let plan = Plan::for_identity(identity);
         let mut api =
             WGApi::<Kernel>::new(IFACE.to_string()).context("opening the WireGuard netlink API")?;
 
@@ -144,7 +160,7 @@ impl Tunnel {
         let config = InterfaceConfiguration {
             name: IFACE.to_string(),
             prvkey: base64_key(&self.private_key),
-            addresses: vec![self.plan.own_address()],
+            addresses: self.plan.own_addresses(),
             port: self.listen_port,
             peers: vec![self.peer()],
             mtu: Some(MTU),
@@ -196,6 +212,14 @@ impl Tunnel {
 
     pub fn peer_addr(&self) -> Ipv4Addr {
         self.plan.peer_v4
+    }
+
+    pub fn own_addr_v6(&self) -> Option<Ipv6Addr> {
+        self.plan.own_v6
+    }
+
+    pub fn peer_addr_v6(&self) -> Option<Ipv6Addr> {
+        self.plan.peer_v6
     }
 
     /// Consumes `self` so the `Drop` path cannot also run.
@@ -291,8 +315,8 @@ mod tests {
     #[test]
     fn the_interface_address_carries_a_subnet() {
         let plan = Plan::for_role(Role::Client);
-        assert_eq!(plan.own_address().cidr, PREFIX_V4);
-        assert!(!plan.own_address().is_host());
+        assert_eq!(plan.own_addresses()[0].cidr, PREFIX_V4);
+        assert!(!plan.own_addresses()[0].is_host());
     }
 
     #[test]

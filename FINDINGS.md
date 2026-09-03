@@ -34,7 +34,7 @@ feature-gated code can be load bearing for anything they prove.
 | `demo` | shipped | 2 | The whole thing working, and nothing else — the one you boot to look around |
 | `laptop` | testing | 1 | The client decision path: `connect4/6`, `getpeername4/6`, `sendmsg4/6`, `recvmsg4/6` |
 | `isolation` | testing | 1 | Containers, manual netns, `PrivateNetwork`, plus negative controls |
-| `datapath-ethernet` | testing | 2 | The server datapath over plain ethernet |
+| `datapath-ethernet` | testing | 2 | The server datapath over plain ethernet, both families |
 | `datapath-wireguard` | testing | 2 | The same assertions over a real WireGuard tunnel |
 
 `demo` is the odd one out on purpose: it asserts almost nothing, because its job is to be booted.
@@ -76,6 +76,7 @@ socket, and checksums surviving GSO — both work.
 | 6 | Does `bpf_sk_lookup_udp()` work from `sendmsg4`, and can `recvmsg4` restore the source? | **Yes** |
 | 7 | Which hook fires for connected vs unconnected UDP? | **Disjoint.** Connected uses `connect4` only; unconnected uses `sendmsg4` only |
 | 8 | Is `bpf_setsockopt(TCP_SYNCNT)` permitted in `cgroup_sock_addr`? | **Yes**, verifier-accepted and returns 0 at runtime |
+| 10 | Can the same be done for IPv6, where `::1` is the only loopback address? | **Yes**, but only by redirecting into `lo`. Unlike v4 that costs no sysctl |
 
 ---
 
@@ -284,6 +285,103 @@ another reason:
 
 The implementation was removed rather than left behind a flag; a rejected design is worse as dead
 code than as a recorded measurement.
+
+### For IPv6 the same redirect is the *only* option, and it costs nothing
+
+The v4 argument above inverts completely. There is exactly one loopback check in the whole IPv6
+stack, `net/ipv6/ip6_input.c`:
+
+```c
+	if ((ipv6_addr_loopback(&hdr->saddr) ||
+	     ipv6_addr_loopback(&hdr->daddr)) &&
+	    !(dev->flags & IFF_LOOPBACK) &&
+	    !netif_is_l3_master(dev))
+		goto err;
+```
+
+It has no sysctl. RFC 4291 §2.5.3 is stated as a rule rather than a default, so there is no v6
+`route_localnet` to look for. Two consequences:
+
+- **Rung A cannot work.** Rewriting the destination to `::1` and returning `TC_ACT_OK` leaves the
+  packet to be dropped in `ip6_rcv_core`. Measured, not assumed: the datapath suite runs the
+  ingress program with `--no-v6-redirect` and gets `TIMEOUT` while `tc_ingress.rewritten_tcp` still
+  climbs — the program did its work and the kernel discarded the result.
+- **Rung C costs no sysctl**, because the check is on *input* only. `ipv6_addr_loopback` appears
+  nowhere in the output path, so the reply leaves with a `::1` source unhindered and egress rewrites
+  it as it does for v4. The reason Rung C lost for v4 — needing `route_localnet` on `lo` as well —
+  simply does not exist here. Nothing on `lo` is configured or attached; the redirect is an action
+  taken by needlecast's own program on its own interface.
+
+The two mechanical details above still apply and are still load bearing. One correction to them:
+`bpf_skb_change_head` zeroes the room it makes, so on an L3-only device the MAC is already fresh —
+but the *ethertype* must still be written, or `eth_type_trans` reads a zero as an 802.3 length and
+the frame never reaches the IPv6 handler. On an Ethernet-framed device nothing is zeroed for us, so
+both halves are written unconditionally.
+
+`netif_is_l3_master` is a third escape: enslaving the interface to a VRF also skips the check. Not
+taken — it means creating and owning a second interface, where the redirect needs none.
+
+### Nothing polls any more, and the last hook needed the verifier consulted
+
+The listener feed and the network-change detector were both 250ms polls. Replacing them turned up
+one rule worth recording, in `__sock_filter_check_attach_type`:
+
+| Field | Readable under |
+|---|---|
+| `bound_dev_if`, `mark`, `priority` | `SOCK_CREATE`, `SOCK_RELEASE` |
+| `src_ip4` | `POST_BIND4` |
+| `src_ip6` | `POST_BIND6` |
+| **`src_port`** | **`POST_BIND4` and `POST_BIND6` only** |
+
+So `cgroup/sock_release` cannot filter by port — the program is rejected at load time with
+`Permission denied`, pointing at the field access. It therefore wakes on every UDP socket closing
+rather than only the managed range. That is the right trade: the alternative is a served UDP port
+that stays advertised after its server is gone, which looks exactly like a hang.
+
+Four hooks are needed because none covers both protocols. `sock/inet_sock_set_state` is TCP-only,
+and `post_bind` fires *before* `listen()`, so a TCP wakeup there would always scan too early.
+
+Measured: **zero feed wakeups across five idle seconds**, where the poll it replaced would have
+scanned twenty times.
+
+**The hooks fire before the kernel has published the change**, and this cost a test cycle to find.
+`inet_csk_listen_start` says so itself:
+
+```c
+	/* There is race window here: we announce ourselves listening,
+	 * but this transition is still not validated by get_port().
+	 * It is OK, because this socket enters to hash table only
+	 * after validation is complete.
+	 */
+	inet_sk_state_store(sk, TCP_LISTEN);   /* the tracepoint fires in here */
+	err = sk->sk_prot->get_port(sk, inet->inet_num);
+	...
+		err = sk->sk_prot->hash(sk);       /* only now is it in /proc/net/tcp */
+```
+
+`inet_sk_state_store` calls the tracepoint *before* its `smp_store_release`, and the socket is
+hashed later still — so a scan triggered by the wakeup is guaranteed to run too early, and nothing
+further arrives to correct it. The listener is then never advertised.
+
+It presented as a kernel-version difference rather than a race: identical code passed on 6.18 and
+failed on 7.1, because the wakeup path happened to be slower than the hash on one and not the
+other. A single appear/vanish cycle is not enough to catch it; the suite now does eight.
+
+The fix is one re-read fifty milliseconds after any wakeup. That is not a poll — with nothing
+happening there are no wakeups and so no re-reads — and it closes the same window in the other
+direction, where a socket that has left `LISTEN` is still in the table when the scan runs.
+
+The tracepoint's field offsets are read from `/sys/kernel/tracing/events/sock/inet_sock_set_state/format`
+at load time rather than written into the program. The layout is stable in practice, but it is not
+ABI, and the failure mode of getting it wrong is a feed that goes quiet rather than one that errors.
+
+For network changes, netlink now says *when* to look while the address and route snapshots still
+say *whether* anything mattered — so `needle` coming up, which is a change we made ourselves, still
+produces no wakeup. Reading each message's type (and nothing else) is enough to report which of a
+link, an address or a route moved, so the log line names the cause instead of guessing.
+
+Suspend detection rides on the heartbeat rather than a timer of its own. It fires at least every
+thirty seconds, and nothing is in flight across a suspend anyway.
 
 ### Checksums survive everything tested
 
@@ -756,25 +854,6 @@ tests/lib/transport.nix  ethernet and WireGuard link definitions, for the harnes
 
 # Still open
 
-- **IPv6 on the server datapath.** The tc programs count IPv6 and pass it through, and there is no
-  `sleeve_getpeername6`. The client side is complete. Room is reserved so adding it is new code
-  rather than a layout change: `SleeveConfig` carries the v6 fields, `tc::COUNT` leaves a slot for
-  the v6 program, and `transport::Plan` holds both families.
-
-  One correctness consequence was found while wiring the real client: with no v6 tunnel address,
-  `connect6` would have rewritten `::1` to the *unspecified* address, sending the connection nowhere
-  while looking like it worked. It now declines and counts `no_v6_target` instead.
-
-- **A tracepoint-driven listener feed.** The server polls `/proc/net/tcp` every 250ms; an
-  `inet_sock_set_state` tracepoint would shrink the window in which a just-started server is not
-  yet reachable.
-
-- **A netlink monitor socket** for network-change detection. What is built compares an address and
-  route snapshot on each loop tick, which is enough because the tick is at most five seconds while
-  disconnected — but it is a poll.
-
-- **Suspend and resume, end to end.** The detector is unit tested; a VM cannot suspend.
-
 - **A bind/connect race** in a tight loop from two processes.
 
 **Smaller:**
@@ -784,3 +863,77 @@ tests/lib/transport.nix  ethernet and WireGuard link definitions, for the harnes
 - Only `--network=none` podman containers are covered.
 - Checksum correctness is asserted functionally, through hash-identical transfers, rather than by
   inspecting which `ip_summed` states were exercised.
+
+---
+
+# What only two real machines can prove
+
+Everything above was measured in a VM. These cannot be, and are listed so they are a checklist
+rather than folklore. None is a known problem; each is a claim the suite does not reach.
+
+### Suspend and resume
+
+The one with a real chance of being wrong, because the whole mechanism is inferred from two clocks
+rather than from an event.
+
+```
+# on the laptop, connected and idle
+needlecast status --role client        # note `handshake=` and `state=connected`
+# close the lid, wait past two minutes, reopen
+journalctl -u needlecast-client -f
+```
+
+Expect `resumed from suspend, reconnecting now` within a second or two of the lid opening, and
+`state=connected` shortly after. The failure to watch for is *silence*: `wake::Watch` reads
+`CLOCK_BOOTTIME − CLOCK_MONOTONIC`, and if that gap does not move across a real suspend the daemon
+waits out its backoff instead — up to five seconds, which is survivable, and then a full liveness
+deadline if the socket is also dead, which is not.
+
+A related unit test exists (`the_suspend_gap_holds_still_while_the_machine_is_awake`) and a related
+bug was found by it: reading `CLOCK_BOOTTIME` *first* made the subtraction underflow on a machine
+that had never suspended, and `saturating_sub` reported a flat zero forever. That is fixed, but it
+is exactly the class of thing only a real suspend confirms.
+
+### Roaming between real networks
+
+`resilience` fakes a moved peer with `/etc/hosts`. Only a real move exercises WireGuard's own
+roaming, where the *server* sees the client arrive from a new address without anything being
+re-resolved.
+
+```
+# laptop connected on wifi, then move to a different network entirely
+needlecast status --role client        # peer_endpoint= should follow
+curl http://localhost:8080             # should keep working, or recover within ~5s
+```
+
+Two distinct paths are in play and the test cannot tell them apart: needlecast re-resolving the
+server's name, and WireGuard roaming the peer when a handshake arrives from elsewhere. On a real
+move both happen.
+
+### A two-machine install from the module
+
+The VM suite installs from the module, but on machines that were created together. Worth doing once
+by hand:
+
+```
+head -c 32 /dev/urandom | base64 > secret && chmod 600 secret
+# copy to both machines by hand, mode 600, then set services.needlecast.{server,client}
+needlecast keys /path/to/secret        # the two public keys, on both machines
+wg show needle                         # must agree with them
+```
+
+The prerequisite the tests never have to satisfy: **the client must be able to reach the server's
+`listenPort` (47654/udp)**. Behind NAT that means a port forward. Nothing in needlecast performs
+NAT traversal.
+
+### Long-running stability
+
+VM suites run for minutes. Nothing has been observed over days: no memory growth measurement, no
+check that the counters stay sane after millions of connections, no confirmation that the tunnel
+survives a DHCP lease renewal or a sleeping switch port.
+
+### Battery cost of the idle heartbeat
+
+The design argues that 30s while idle is cheap and 1s while a flow is open is worth it. Never
+measured. `powertop` or `powerstat` on a laptop with the client running and no traffic, against the
+same laptop with it stopped, would settle it.

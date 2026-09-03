@@ -28,6 +28,19 @@ pub const IPV4_SADDR_OFF: usize = 12;
 pub const IPV4_DADDR_OFF: usize = 16;
 pub const IPV4_MIN_HDR: usize = 20;
 
+/// Byte offsets within an IPv6 header, which is a fixed 40 bytes with no checksum.
+pub const IPV6_NEXTHDR_OFF: usize = 6;
+pub const IPV6_SADDR_OFF: usize = 8;
+pub const IPV6_DADDR_OFF: usize = 24;
+pub const IPV6_HDR_LEN: usize = 40;
+
+/// Fragmentation is an extension header rather than a field, so there is nothing to test in the
+/// fixed header — the offset lives eight bytes further in.
+pub const IPPROTO_FRAGMENT: u8 = 44;
+pub const FRAG6_NEXTHDR_OFF: usize = 0;
+pub const FRAG6_OFFSET_OFF: usize = 2;
+pub const FRAG6_HDR_LEN: usize = 8;
+
 /// Byte offsets within the L4 header, from its start.
 pub const L4_SPORT_OFF: usize = 0;
 pub const L4_DPORT_OFF: usize = 2;
@@ -89,6 +102,23 @@ pub fn l4_csum_offset(proto: u8) -> Option<usize> {
         IPPROTO_UDP => Some(UDP_CSUM_OFF),
         _ => None,
     }
+}
+
+/// The IPv6 fragment header's offset field is `| offset (13) | reserved (2) | more (1) |`, so the
+/// v4 mask is wrong by three bits — a mistake that would corrupt only fragmented traffic.
+#[inline(always)]
+pub fn is_first_fragment_v6(frag_off_be: u16) -> bool {
+    u16::from_be(frag_off_be) & 0xfff8 == 0
+}
+
+#[inline(always)]
+pub fn v6_eq(a: &[u32; 4], b: &[u32; 4]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+}
+
+#[inline(always)]
+pub fn v6_is_unspecified(w: &[u32; 4]) -> bool {
+    w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 0
 }
 
 #[cfg(test)]
@@ -184,6 +214,54 @@ mod tests {
             ihl_bytes(0x44) < IPV4_MIN_HDR,
             "the parser must reject this"
         );
+    }
+
+    /// The v4 field packs the offset into the *low* thirteen bits and the flags into the high
+    /// three; v6 does the opposite. Reusing the v4 mask would read three flag bits as offset.
+    #[test]
+    fn the_v6_first_fragment_test_reads_the_offset_from_the_high_bits() {
+        assert!(is_first_fragment_v6(0u16.to_be()), "unfragmented");
+        assert!(
+            is_first_fragment_v6(1u16.to_be()),
+            "offset 0, More Fragments"
+        );
+        assert!(!is_first_fragment_v6((1u16 << 3).to_be()), "offset 1");
+        assert!(!is_first_fragment_v6((185u16 << 3).to_be()));
+        assert!(!is_first_fragment_v6(((185u16 << 3) | 1).to_be()));
+
+        for offset in [1u16, 2, 185, 0x1fff] {
+            assert!(!is_first_fragment_v6((offset << 3).to_be()), "{offset}");
+        }
+
+        // Where the two encodings actually disagree: offset zero with More Fragments set is the
+        // *first* fragment of a datagram, and the v4 mask reads that flag bit as an offset.
+        let first_of_many = 1u16.to_be();
+        assert!(is_first_fragment_v6(first_of_many));
+        assert!(!is_first_fragment(first_of_many));
+    }
+
+    #[test]
+    fn v6_word_comparisons_are_exact() {
+        let a = [1u32, 2, 3, 4];
+        assert!(v6_eq(&a, &[1, 2, 3, 4]));
+        for i in 0..4 {
+            let mut b = a;
+            b[i] ^= 1;
+            assert!(!v6_eq(&a, &b), "word {i} was not compared");
+        }
+        assert!(v6_is_unspecified(&[0; 4]));
+        assert!(!v6_is_unspecified(&LOOPBACK_V6));
+    }
+
+    /// The v6 header is fixed-length, so unlike v4 there is no IHL to trust — but a Fragment
+    /// extension header still moves the L4 header eight bytes further in.
+    #[test]
+    fn the_v6_header_offsets_are_the_fixed_rfc_8200_layout() {
+        assert_eq!(IPV6_HDR_LEN, 40);
+        assert_eq!(IPV6_SADDR_OFF + 16, IPV6_DADDR_OFF);
+        assert_eq!(IPV6_DADDR_OFF + 16, IPV6_HDR_LEN);
+        assert_eq!(FRAG6_HDR_LEN, 8);
+        assert_eq!(IPPROTO_FRAGMENT, 44);
     }
 
     #[test]

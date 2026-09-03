@@ -74,3 +74,6 @@ def serve(m, name, port, token, extra="", bind="127.0.0.1"):
 # The entire point: no assertion ever names the server's address.
 def local(m, port, extra=""):
     return parse(m.succeed(f"nc-probe connect --host 127.0.0.1 --port {port} {extra} || true"))
+
+def local6(m, port, extra=""):
+    return parse(m.succeed(f"nc-probe connect --host ::1 --port {port} --v6 {extra} || true"))

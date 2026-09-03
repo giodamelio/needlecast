@@ -31,7 +31,25 @@ pub const LIVENESS_MULTIPLIER: u32 = 3;
 pub const SERVER_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-pub const LISTENER_POLL: Duration = Duration::from_millis(250);
+
+/// How long after a wakeup to look a second time.
+///
+/// The socket hooks fire *before* the kernel has finished making the change visible. From
+/// `inet_csk_listen_start`:
+///
+/// ```text
+///     /* There is race window here: we announce ourselves listening,
+///      * but this transition is still not validated by get_port(). */
+///     inet_sk_state_store(sk, TCP_LISTEN);   // the tracepoint fires here
+///     err = sk->sk_prot->get_port(sk, inet->inet_num);
+///     ...
+///         err = sk->sk_prot->hash(sk);       // only now is it in /proc/net/tcp
+/// ```
+///
+/// So the scan a wakeup triggers can miss the very listener that caused it, and nothing further
+/// arrives to correct that. One re-read settles it. This is not a poll: with nothing happening
+/// there are no wakeups and so no re-reads.
+const SETTLE: Duration = Duration::from_millis(50);
 
 /// Deep enough that a burst cannot stall the reader, shallow enough that a stalled consumer is
 /// noticed rather than buffered indefinitely.
@@ -94,6 +112,68 @@ pub fn spawn_reader(mut half: OwnedReadHalf) -> mpsc::Receiver<std::io::Result<M
 /// The channel closing means the reader task ended, which only happens on EOF or a fatal error.
 fn peer_gone() -> anyhow::Error {
     anyhow::anyhow!("the peer closed the control connection")
+}
+
+/// A count of wakeups from the BPF listener feed, so a connection can wait on "something changed"
+/// without knowing anything about ring buffers.
+///
+/// A `watch` rather than a channel because the *value* is meaningless: a connection that missed
+/// three wakeups while busy needs one scan, not three.
+pub type Listeners = tokio::sync::watch::Receiver<u64>;
+
+/// Drains the ring buffer forever and bumps the counter. One task owns it because a ring buffer
+/// has a single consumer, while there may be several control connections.
+pub fn spawn_feed(ring: aya::maps::RingBuf<aya::maps::MapData>) -> Result<Listeners> {
+    let (tx, rx) = tokio::sync::watch::channel(0u64);
+    let mut fd =
+        tokio::io::unix::AsyncFd::new(ring).context("watching the listener ring buffer")?;
+    tokio::spawn(async move {
+        loop {
+            let mut guard = match fd.readable_mut().await {
+                Ok(g) => g,
+                Err(e) => {
+                    log::error!("listener feed stopped: {e}");
+                    return;
+                }
+            };
+            let mut woke = false;
+            while guard.get_inner_mut().next().is_some() {
+                woke = true;
+            }
+            guard.clear_ready();
+            // Coalesced on purpose: a burst of binds is one rescan.
+            if woke {
+                tx.send_modify(|n| *n += 1);
+            }
+        }
+    });
+    Ok(rx)
+}
+
+/// Sends the current set only when it differs, so a wakeup that turns out to change nothing costs
+/// a `/proc` read rather than a frame.
+async fn publish(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    published: &mut Option<BTreeSet<u16>>,
+    port_lo: u16,
+    port_hi: u16,
+) -> Result<()> {
+    let now: BTreeSet<u16> = local_listeners()?
+        .into_iter()
+        .filter(|p| *p >= port_lo && *p <= port_hi)
+        .collect();
+    if published.as_ref() == Some(&now) {
+        return Ok(());
+    }
+    wire::write(
+        writer,
+        &Msg::Listeners {
+            ports: now.iter().copied().collect(),
+        },
+    )
+    .await?;
+    *published = Some(now);
+    Ok(())
 }
 
 /// Ports reachable through this machine's own loopback, which includes wildcard binds.
@@ -181,6 +261,7 @@ pub async fn serve(
     port: u16,
     port_lo: u16,
     port_hi: u16,
+    listeners: Listeners,
     shutdown: &mut Shutdown,
 ) -> Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((bind, port)))
@@ -193,8 +274,9 @@ pub async fn serve(
             _ = shutdown.requested() => return Ok(()),
             accepted = listener.accept() => accepted.context("accepting a control connection")?,
         };
+        let listeners = listeners.clone();
         tokio::spawn(async move {
-            match serve_one(stream, port_lo, port_hi).await {
+            match serve_one(stream, port_lo, port_hi, listeners).await {
                 Ok(()) => log::info!("{peer}: control connection ended"),
                 Err(e) => match e.downcast_ref::<VersionMismatch>() {
                     // Fatal by design: no negotiation, no compatibility shim.
@@ -209,7 +291,12 @@ pub async fn serve(
     }
 }
 
-async fn serve_one(mut stream: TcpStream, port_lo: u16, port_hi: u16) -> Result<()> {
+async fn serve_one(
+    mut stream: TcpStream,
+    port_lo: u16,
+    port_hi: u16,
+    mut listeners: Listeners,
+) -> Result<()> {
     stream.set_nodelay(true)?;
     exchange_version(&mut stream, CONNECT_TIMEOUT).await?;
 
@@ -217,25 +304,30 @@ async fn serve_one(mut stream: TcpStream, port_lo: u16, port_hi: u16) -> Result<
     wire::write(&mut writer, &Msg::Welcome { port_lo, port_hi }).await?;
     let mut frames = spawn_reader(reader);
 
+    // Once up front, because the feed only reports *changes* and a server that was already
+    // listening when the client connected produced no event to hear.
     let mut published: Option<BTreeSet<u16>> = None;
+    publish(&mut writer, &mut published, port_lo, port_hi).await?;
+
     let mut last_heard = Instant::now();
-    // Fires immediately, so the first snapshot does not wait for a heartbeat round trip.
-    let mut scan = tokio::time::interval(LISTENER_POLL);
+    let mut settle: Option<tokio::time::Instant> = None;
     loop {
         tokio::select! {
-            _ = scan.tick() => {
-                let now: BTreeSet<u16> = local_listeners()?
-                    .into_iter()
-                    .filter(|p| *p >= port_lo && *p <= port_hi)
-                    .collect();
-                if published.as_ref() != Some(&now) {
-                    wire::write(
-                        &mut writer,
-                        &Msg::Listeners { ports: now.iter().copied().collect() },
-                    )
-                    .await?;
-                    published = Some(now);
+            changed = listeners.changed() => {
+                // The sender lives as long as the daemon, so this only fails if the feed died.
+                changed.context("the listener feed stopped")?;
+                publish(&mut writer, &mut published, port_lo, port_hi).await?;
+                settle = Some(tokio::time::Instant::now() + SETTLE);
+            }
+            // See `SETTLE`: the wakeup can arrive before the kernel has published the change.
+            () = async {
+                match settle {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
                 }
+            } => {
+                settle = None;
+                publish(&mut writer, &mut published, port_lo, port_hi).await?;
             }
             frame = frames.recv() => {
                 let msg = frame.ok_or_else(peer_gone)??;
@@ -424,7 +516,6 @@ mod tests {
 
     #[test]
     fn the_timers_are_ordered_so_no_side_gives_up_first_by_accident() {
-        assert!(LISTENER_POLL < PING_INTERVAL);
         assert!(PING_INTERVAL < IDLE_PING_INTERVAL);
         assert!(IDLE_PING_INTERVAL * LIVENESS_MULTIPLIER < SERVER_IDLE_TIMEOUT);
     }

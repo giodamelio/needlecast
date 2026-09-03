@@ -6,6 +6,7 @@
 
 mod maps;
 mod packet;
+mod packet6;
 mod sock;
 
 mod decide;
@@ -16,7 +17,9 @@ mod getpeername;
 mod recvmsg;
 mod sendmsg;
 
+mod listener_events;
 mod sleeve_peer;
+mod sleeve_peer6;
 mod syncnt_probe;
 mod tc_egress;
 mod tc_ingress;

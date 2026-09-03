@@ -21,6 +21,9 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const SERVER_INFO: &[u8] = b"needlecast server key v1";
 const CLIENT_INFO: &[u8] = b"needlecast client key v1";
 
+/// And this one changes the tunnel's IPv6 prefix.
+const ULA_INFO: &[u8] = b"needlecast ula v1";
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     Server,
@@ -64,6 +67,9 @@ pub struct Identity {
     pub private: [u8; 32],
     pub public: [u8; 32],
     pub peer_public: [u8; 32],
+    /// Derived here rather than from a retained secret, so the secret does not outlive `derive`.
+    pub own_v6: std::net::Ipv6Addr,
+    pub peer_v6: std::net::Ipv6Addr,
 }
 
 impl Identity {
@@ -79,8 +85,36 @@ impl Identity {
             private,
             public,
             peer_public: keypair(secret, role.peer()).1,
+            own_v6: ula_address(secret, role),
+            peer_v6: ula_address(secret, role.peer()),
         }
     }
+}
+
+/// The `/48` this pair uses, derived from the same secret so there is still nothing to configure
+/// and no chance of two pairs colliding.
+///
+/// RFC 4193 asks for a random 40-bit global ID under `fd00::/8`, which is exactly what HKDF gives.
+/// The last two words are the host part: `…::1` for the server, `…::2` for the client.
+pub fn ula_prefix(secret: &[u8]) -> [u8; 6] {
+    let hk = Hkdf::<Sha256>::new(None, secret);
+    let mut out = [0u8; 6];
+    hk.expand(ULA_INFO, &mut out[1..])
+        .expect("5 bytes is a valid HKDF-SHA256 output length");
+    out[0] = 0xfd;
+    out
+}
+
+/// `…::1` for the server, `…::2` for the client — matching the v4 addresses they sit beside.
+pub fn ula_address(secret: &[u8], role: Role) -> std::net::Ipv6Addr {
+    let prefix = ula_prefix(secret);
+    let mut octets = [0u8; 16];
+    octets[..6].copy_from_slice(&prefix);
+    octets[15] = match role {
+        Role::Server => 1,
+        Role::Client => 2,
+    };
+    std::net::Ipv6Addr::from(octets)
 }
 
 /// `(private, public)`.
@@ -167,6 +201,58 @@ mod tests {
         let a = Identity::derive(b"one", Role::Server);
         let b = Identity::derive(b"two", Role::Server);
         assert_ne!(a.public, b.public);
+    }
+
+    /// Cross-checked against an independent HKDF-SHA256 implementation, like the keys above, and
+    /// pinned for the same reason: a changed prefix is a changed network, so it has to be as
+    /// deliberate as a protocol change.
+    #[test]
+    fn the_ula_is_stable() {
+        assert_eq!(
+            ula_address(SECRET, Role::Server).to_string(),
+            "fdf0:2d9e:995e::1"
+        );
+        assert_eq!(
+            ula_address(SECRET, Role::Client).to_string(),
+            "fdf0:2d9e:995e::2"
+        );
+    }
+
+    #[test]
+    fn the_ula_is_inside_the_rfc_4193_space() {
+        for secret in [SECRET, b"one".as_slice(), b"two", b"a much longer secret"] {
+            let addr = ula_address(secret, Role::Server);
+            assert_eq!(addr.octets()[0], 0xfd, "{addr} is not in fd00::/8");
+            assert!(addr.is_unique_local(), "{addr}");
+            // Not loopback, or the tc programs would rewrite toward the address they deliver to.
+            assert_ne!(addr, std::net::Ipv6Addr::LOCALHOST);
+        }
+    }
+
+    #[test]
+    fn both_roles_share_a_prefix_and_differ_in_the_host_part() {
+        let server = ula_address(SECRET, Role::Server).octets();
+        let client = ula_address(SECRET, Role::Client).octets();
+        assert_eq!(server[..6], client[..6], "the /48 must be shared");
+        assert_eq!(server[15], 1);
+        assert_eq!(client[15], 2);
+        assert_eq!(&server[6..15], &[0u8; 9], "the host part is otherwise zero");
+    }
+
+    #[test]
+    fn a_different_secret_gives_a_different_prefix() {
+        assert_ne!(ula_prefix(b"one"), ula_prefix(b"two"));
+        assert_ne!(ula_prefix(SECRET), ula_prefix(b"one"));
+    }
+
+    /// The ULA comes from the same secret as the keys, so a slip in the info string would silently
+    /// make one a function of the other.
+    #[test]
+    fn the_ula_is_independent_of_the_keys() {
+        let id = Identity::derive(SECRET, Role::Server);
+        let prefix = ula_prefix(SECRET);
+        assert_ne!(&id.public[..5], &prefix[1..]);
+        assert_ne!(&id.private[..5], &prefix[1..]);
     }
 
     #[test]

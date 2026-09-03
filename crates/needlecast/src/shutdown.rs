@@ -29,14 +29,6 @@ impl Shutdown {
             _ = self.interrupt.recv() => {}
         }
     }
-
-    /// Returns early when a signal arrives, so a backoff cannot delay the exit by its full length.
-    pub async fn sleep(&mut self, total: std::time::Duration) {
-        tokio::select! {
-            _ = self.requested() => {}
-            _ = tokio::time::sleep(total) => {}
-        }
-    }
 }
 
 #[cfg(test)]
@@ -44,32 +36,28 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    /// One test rather than three: a raised signal is process-wide, so anything else asserting on
-    /// its *absence* would see this one and fail whenever the two ran together.
+    /// One test rather than several: a raised signal is process-wide, so anything asserting on its
+    /// *absence* would see this one and fail whenever the two ran together.
     ///
     /// Raising is safe because installing has already replaced the default disposition — which is
     /// itself the thing worth proving, since getting it wrong kills the daemon instead.
     #[tokio::test]
-    async fn a_signal_is_observed_rather_than_fatal_and_cuts_a_sleep_short() {
+    async fn both_signals_are_observed_rather_than_fatal() {
         let mut s = Shutdown::install().expect("install");
 
-        let started = tokio::time::Instant::now();
-        s.sleep(Duration::from_millis(300)).await;
+        // Nothing pending, so this must not resolve.
         assert!(
-            started.elapsed() >= Duration::from_millis(280),
-            "returned early with no signal pending"
+            tokio::time::timeout(Duration::from_millis(200), s.requested())
+                .await
+                .is_err(),
+            "resolved with no signal pending"
         );
 
-        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-        tokio::time::timeout(Duration::from_secs(5), s.requested())
-            .await
-            .expect("SIGTERM was not observed");
-
-        assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
-        let started = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_secs(5), s.sleep(Duration::from_secs(30)))
-            .await
-            .expect("SIGINT did not cut the sleep short");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        for signal in [libc::SIGTERM, libc::SIGINT] {
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            tokio::time::timeout(Duration::from_secs(5), s.requested())
+                .await
+                .unwrap_or_else(|_| panic!("signal {signal} was not observed"));
+        }
     }
 }

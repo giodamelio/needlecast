@@ -55,6 +55,48 @@ with subtest("a port appearing on the server becomes usable without restarting a
     )
     print("a new server port became usable")
 
+# The feed replaced a 250ms poll. Both halves of that are asserted: it is quiet when nothing
+# happens, and it reacts far faster than the poll it replaced when something does.
+with subtest("the listener feed is silent while nothing changes"):
+    import time as _t
+    before = counters(server, "tc-counters").get("listener_feed.total", 0)
+    _t.sleep(5)
+    after = counters(server, "tc-counters").get("listener_feed.total", 0)
+    print(f"feed wakeups over 5 idle seconds: {after - before}")
+    # The old poll would have scanned twenty times here.
+    assert after - before <= 2, f"the feed is still polling: {after - before} wakeups"
+
+with subtest("a new listener is advertised, and the feed is what noticed"):
+    before = counters(server, "tc-counters").get("listener_feed.total", 0)
+    serve(server, "fast", 8085, "fast-side")
+    server.wait_until_succeeds("ss -lnt | grep -q '127.0.0.1:8085'", timeout=30)
+    client.wait_until_succeeds(
+        "needlecast status --role client | grep -q 'server_listeners=.*8085'", timeout=30
+    )
+    # The wall-clock here is the framework's own one-second polling, so it measures nothing about
+    # propagation. What it does establish is that the wakeup came from the tracepoint.
+    woke = counters(server, "tc-counters").get("listener_feed.total", 0) - before
+    print(f"feed wakeups for one new listener: {woke}")
+    assert woke >= 1, "the listener appeared without the feed noticing"
+
+# The hooks fire before the kernel has published the change, so a single scan can miss the very
+# listener that woke it. Once is not enough to catch that — it depends on which of the two wins a
+# race measured in microseconds, and it went unnoticed on one kernel while failing on another.
+with subtest("a listener appearing and vanishing is caught every time, not most times"):
+    for i in range(8):
+        port = 8100 + i
+        serve(server, f"churn{i}", port, f"churn-{i}")
+        server.wait_until_succeeds(f"ss -lnt | grep -q '127.0.0.1:{port}'", timeout=30)
+        client.wait_until_succeeds(
+            f"needlecast status --role client | grep -q 'server_listeners=.*{port}'", timeout=15
+        )
+        server.succeed(f"systemctl stop churn{i}.service")
+        server.wait_until_fails(f"ss -lnt | grep -q '127.0.0.1:{port}'", timeout=30)
+        client.wait_until_fails(
+            f"needlecast status --role client | grep -q 'server_listeners=.*{port}'", timeout=15
+        )
+    print("eight appear/vanish cycles, every one propagated")
+
 with subtest("a port disappearing stops being forwarded"):
     server.succeed("systemctl stop dev2.service")
     server.wait_until_fails(f"ss -lnt | grep -q '127.0.0.1:{OTHER}'", timeout=30)

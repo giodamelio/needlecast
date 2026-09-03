@@ -146,50 +146,48 @@ pub fn count_rewrite(prog: TcProg, proto: u8) {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Version {
+    V4,
+    V6,
+}
+
 /// An Ethernet-framed device says so in the ethertype; an L3-only one has no such header, leaving
 /// the IP version nibble as the only source.
 #[inline(always)]
-fn is_ipv4(ctx: &TcContext, prog: TcProg, l3_offset: usize) -> bool {
+fn ip_version(ctx: &TcContext, prog: TcProg, l3_offset: usize) -> Option<Version> {
     let version_byte = if l3_offset >= net::ETH_HDR_LEN {
-        let Ok(ethertype) = ctx.load::<u16>(net::ETH_TYPE_OFF) else {
-            return false;
-        };
+        let ethertype = ctx.load::<u16>(net::ETH_TYPE_OFF).ok()?;
         match u16::from_be(ethertype) {
-            net::ETH_P_IP => return true,
-            net::ETH_P_IPV6 => {
-                tc_bump(prog, TcEv::V6);
-                return false;
-            }
+            net::ETH_P_IP => return Some(Version::V4),
+            net::ETH_P_IPV6 => return Some(Version::V6),
             _ => {
                 tc_bump(prog, TcEv::NotIp);
-                return false;
+                return None;
             }
         }
     } else {
-        let Ok(b) = ctx.load::<u8>(l3_offset) else {
-            return false;
-        };
-        b
+        ctx.load::<u8>(l3_offset).ok()?
     };
     match net::ip_version(version_byte) {
-        4 => true,
-        6 => {
-            tc_bump(prog, TcEv::V6);
-            false
-        }
+        4 => Some(Version::V4),
+        6 => Some(Version::V6),
         _ => {
             tc_bump(prog, TcEv::NotIp);
-            false
+            None
         }
     }
 }
 
-/// The preamble both tc programs share.
+/// The preamble both tc programs share. IPv6 reaches `v6` only once a v6 tunnel address is
+/// configured; before that it is counted and passed through, which is what an IPv4-only pairing
+/// wants.
 #[inline(always)]
 pub fn run(
     ctx: &mut TcContext,
     prog: TcProg,
-    f: fn(&mut TcContext, &SleeveConfig, usize) -> i32,
+    v4: fn(&mut TcContext, &SleeveConfig, usize) -> i32,
+    v6: fn(&mut TcContext, &SleeveConfig, usize) -> i32,
 ) -> i32 {
     tc_bump(prog, TcEv::Total);
     let Some(cfg) = SLEEVE_CONFIG.get(0) else {
@@ -199,8 +197,15 @@ pub fn run(
         return OK;
     }
     let l3 = cfg.l3_offset as usize;
-    if !is_ipv4(ctx, prog, l3) {
-        return OK;
+    match ip_version(ctx, prog, l3) {
+        Some(Version::V4) => v4(ctx, cfg, l3),
+        Some(Version::V6) => {
+            if net::v6_is_unspecified(&cfg.transport_v6) {
+                tc_bump(prog, TcEv::V6);
+                return OK;
+            }
+            v6(ctx, cfg, l3)
+        }
+        None => OK,
     }
-    f(ctx, cfg, l3)
 }

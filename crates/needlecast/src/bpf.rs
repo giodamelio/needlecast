@@ -167,6 +167,59 @@ pub fn l3_offset_for(iface: &str) -> Result<u16> {
     })
 }
 
+const TRACEFS: &str = "/sys/kernel/tracing/events/sock/inet_sock_set_state/format";
+
+/// The offsets the listener feed reads, taken from the tracepoint's own `format` file.
+///
+/// Hardcoding them would work today on every kernel tested. It is still the wrong trade: the layout
+/// is not ABI, and getting it wrong makes the feed go quiet rather than fail, which is the hardest
+/// kind of bug to notice.
+pub fn tracepoint_offsets() -> Result<needlecast_common::FeedConfig> {
+    let text = std::fs::read_to_string(TRACEFS)
+        .with_context(|| format!("reading {TRACEFS}; is tracefs mounted?"))?;
+    Ok(needlecast_common::FeedConfig {
+        oldstate_off: field_offset(&text, "oldstate")?,
+        newstate_off: field_offset(&text, "newstate")?,
+        sport_off: field_offset(&text, "sport")?,
+        port_lo: 0,
+        port_hi: 0,
+    })
+}
+
+/// Lines look like `\tfield:int newstate;\toffset:20;\tsize:4;\tsigned:1;`.
+fn field_offset(format: &str, name: &str) -> Result<u32> {
+    for line in format.lines() {
+        let Some((decl, rest)) = line.split_once(";") else {
+            continue;
+        };
+        // Match the whole identifier, or `sport` would also match `dport`'s neighbour in a future
+        // layout, and `state` would match both of the ones wanted here.
+        if !decl
+            .rsplit([' ', '\t', '*'])
+            .next()
+            .is_some_and(|last| last == name)
+        {
+            continue;
+        }
+        let Some(off) = rest.split("offset:").nth(1) else {
+            continue;
+        };
+        let digits: String = off.chars().take_while(|c| c.is_ascii_digit()).collect();
+        return digits
+            .parse()
+            .with_context(|| format!("parsing the offset of {name} from {line:?}"));
+    }
+    bail!("{TRACEFS} has no field named {name}")
+}
+
+/// Where the v6 datapath redirects an inbound packet. Read rather than assumed to be 1: that is
+/// true on every kernel in practice, but a wrong ifindex would deliver traffic to another device.
+pub fn loopback_ifindex() -> Result<u32> {
+    let path = "/sys/class/net/lo/ifindex";
+    let raw = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    raw.trim().parse().context("parsing lo's ifindex")
+}
+
 /// Returns the same value `bpf_get_netns_cookie` reports from inside a program, which is what
 /// makes the container guard implementable.
 pub fn netns_cookie() -> Result<u64> {
@@ -337,5 +390,54 @@ mod tests {
     #[test]
     fn the_embedded_object_is_aligned() {
         assert_object_aligned().expect("aligned");
+    }
+
+    /// A real `format` file, so the parser is tested against the shape it will actually meet.
+    const SET_STATE_FORMAT: &str = "\
+name: inet_sock_set_state
+ID: 1234
+format:
+\tfield:unsigned short common_type;\toffset:0;\tsize:2;\tsigned:0;
+\tfield:unsigned char common_flags;\toffset:2;\tsize:1;\tsigned:0;
+\tfield:unsigned char common_preempt_count;\toffset:3;\tsize:1;\tsigned:0;
+\tfield:int common_pid;\toffset:4;\tsize:4;\tsigned:1;
+
+\tfield:const void * skaddr;\toffset:8;\tsize:8;\tsigned:0;
+\tfield:int oldstate;\toffset:16;\tsize:4;\tsigned:1;
+\tfield:int newstate;\toffset:20;\tsize:4;\tsigned:1;
+\tfield:__u16 sport;\toffset:24;\tsize:2;\tsigned:0;
+\tfield:__u16 dport;\toffset:26;\tsize:2;\tsigned:0;
+\tfield:__u16 family;\toffset:28;\tsize:2;\tsigned:0;
+\tfield:__u8 saddr[4];\toffset:32;\tsize:4;\tsigned:0;
+";
+
+    #[test]
+    fn tracepoint_field_offsets_are_read_from_the_format() {
+        assert_eq!(field_offset(SET_STATE_FORMAT, "oldstate").unwrap(), 16);
+        assert_eq!(field_offset(SET_STATE_FORMAT, "newstate").unwrap(), 20);
+        assert_eq!(field_offset(SET_STATE_FORMAT, "sport").unwrap(), 24);
+        assert_eq!(field_offset(SET_STATE_FORMAT, "dport").unwrap(), 26);
+    }
+
+    /// `sport` and `dport` differ by one character, and `state` is a suffix of both the fields
+    /// that matter. A substring match would silently pick whichever came first.
+    #[test]
+    fn a_field_name_matches_whole_or_not_at_all() {
+        assert!(field_offset(SET_STATE_FORMAT, "state").is_err());
+        assert!(field_offset(SET_STATE_FORMAT, "port").is_err());
+        assert!(field_offset(SET_STATE_FORMAT, "addr").is_err());
+        assert!(field_offset(SET_STATE_FORMAT, "nonesuch").is_err());
+    }
+
+    /// A pointer field's name abuts its `*`, so the split has to treat that as whitespace.
+    #[test]
+    fn a_pointer_field_is_still_found_by_name() {
+        assert_eq!(field_offset(SET_STATE_FORMAT, "skaddr").unwrap(), 8);
+    }
+
+    #[test]
+    fn a_missing_format_names_the_field_rather_than_panicking() {
+        let err = field_offset("", "newstate").expect_err("no fields");
+        assert!(err.to_string().contains("newstate"), "{err}");
     }
 }

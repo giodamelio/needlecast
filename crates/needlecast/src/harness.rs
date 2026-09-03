@@ -47,10 +47,21 @@ pub enum Command {
         transport_v4: Ipv4Addr,
         #[arg(long)]
         transport_peer_v4: Ipv4Addr,
+        /// The shipped server derives these from the secret; naming them is the only way to drive
+        /// the v6 datapath on an interface someone else created.
+        #[arg(long)]
+        transport_v6: Option<Ipv6Addr>,
+        #[arg(long)]
+        transport_peer_v6: Option<Ipv6Addr>,
         #[arg(long, default_value_t = 8000)]
         port_lo: u16,
         #[arg(long, default_value_t = 8999)]
         port_hi: u16,
+        /// End v6 ingress with `TC_ACT_OK` rather than redirecting into `lo`. The suite's negative
+        /// control: without it, "the redirect is what makes v6 work" is an argument rather than a
+        /// measurement.
+        #[arg(long)]
+        no_v6_redirect: bool,
         /// Also serve the control plane on the transport address.
         #[arg(long)]
         control_port: Option<u16>,
@@ -95,19 +106,43 @@ pub async fn run(cmd: Command) -> Result<()> {
             iface,
             transport_v4,
             transport_peer_v4,
+            transport_v6,
+            transport_peer_v6,
             port_lo,
             port_hi,
+            no_v6_redirect,
             control_port,
         } => {
             if port_lo > port_hi {
                 bail!("--port-lo must not exceed --port-hi");
             }
-            let datapath =
-                Datapath::attach(&iface, transport_v4, transport_peer_v4, port_lo, port_hi)?;
+            let datapath = Datapath::attach(
+                &iface,
+                crate::server::Sleeve {
+                    transport_v4,
+                    transport_peer_v4,
+                    transport_v6,
+                    transport_peer_v6,
+                    port_lo,
+                    port_hi,
+                    l3_offset: 0,
+                    lo_ifindex: 0,
+                    v6_redirect: !no_v6_redirect,
+                },
+            )?;
+            let mut datapath = datapath;
             match control_port {
                 Some(port) => {
-                    crate::control::serve(transport_v4, port, port_lo, port_hi, &mut shutdown)
-                        .await?
+                    let listeners = datapath.take_feed()?;
+                    crate::control::serve(
+                        transport_v4,
+                        port,
+                        port_lo,
+                        port_hi,
+                        listeners,
+                        &mut shutdown,
+                    )
+                    .await?
                 }
                 None => hold(&mut shutdown).await,
             }

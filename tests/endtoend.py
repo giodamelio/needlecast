@@ -111,6 +111,31 @@ with subtest("a bulk transfer survives the whole chain"):
     assert int(r["bytes"]) == 209715200, r
     assert client.succeed("sha256sum /tmp/blob").split()[0] == want
 
+# The v6 half of the same claim, and the only end-to-end coverage of the loopback redirect: the
+# client rewrites `::1` at connect(), the server delivers to `::1`, and neither application ever
+# sees a tunnel address.
+with subtest("[::1]:8080 on the client reaches the server's v6 dev server"):
+    V6_PORT = 8070
+    serve(server, "dev6", V6_PORT, "server-side-v6", "--v6 --hold 120", bind="::1")
+    server.wait_until_succeeds(f"ss -lnt | grep -q ':{V6_PORT}'", timeout=30)
+    client.wait_until_succeeds(
+        f"needlecast status --role client | grep -q 'server_listeners=.*{V6_PORT}'", timeout=60
+    )
+    r = local6(client, V6_PORT)
+    print(f"v6 end to end: {r}")
+    assert r.get("data") == "server-side-v6", r
+
+with subtest("both applications still believe the peer is loopback over v6"):
+    assert local6(client, V6_PORT).get("peer", "").startswith("::1"), "the client's view"
+    c = counters(client, "counters")
+    assert c.get("connect6.rewritten", 0) >= 1, c
+    assert c.get("getpeername6.restored", 0) >= 1, c
+    assert c.get("connect6.no_v6_target", 0) == 0, c
+
+with subtest("a v6 port the server does not serve fails cleanly rather than hanging"):
+    r = local6(client, 8091, "--timeout 15")
+    assert r.get("error") == "ECONNREFUSED", r
+
 with subtest("a port the server does not serve fails, and does not hang"):
     r = local(client, 8090, "--timeout 15")
     print(f"unserved port: {r}")

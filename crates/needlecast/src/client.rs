@@ -25,10 +25,6 @@ const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 const ENDPOINT_REFRESH: Duration = Duration::from_secs(300);
 
-/// How often the local network is re-examined. A poll because the snapshot is all `wake::Watch`
-/// has to compare; Phase C replaces the timer with a netlink socket and keeps the comparison.
-const WATCH_POLL: Duration = Duration::from_millis(250);
-
 pub struct Args {
     pub secret: PathBuf,
     pub peer: String,
@@ -44,18 +40,28 @@ pub async fn run(a: Args) -> Result<()> {
     let endpoint = format!("{}:{}", a.peer, a.listen_port);
     let mut tunnel = Tunnel::up(&identity, &endpoint, a.listen_port).await?;
 
-    let bridge = Bridge::attach(tunnel.peer_addr(), a.syncnt)?;
+    let bridge = Bridge::attach(tunnel.peer_addr(), tunnel.peer_addr_v6(), a.syncnt)?;
     let control_addr = SocketAddr::from((tunnel.peer_addr(), a.control_port));
 
     let mut backoff = BACKOFF_MIN;
     let mut watch = wake::Watch::new();
+    let mut netlink = tokio::io::unix::AsyncFd::new(wake::Monitor::open()?)
+        .context("watching netlink for local network changes")?;
     loop {
         // A moved peer is one of the two reasons a reconnect would otherwise never succeed.
         if let Err(e) = tunnel.refresh_endpoint().await {
             log::debug!("could not re-resolve {endpoint}: {e:#}");
         }
 
-        match session(&mut tunnel, control_addr, &mut shutdown, &mut watch).await {
+        match session(
+            &mut tunnel,
+            control_addr,
+            &mut shutdown,
+            &mut watch,
+            &mut netlink,
+        )
+        .await
+        {
             Ok(Ended::Shutdown) => break,
             Ok(Ended::PeerGone) => log::info!("control connection closed"),
             Err(e) => {
@@ -72,10 +78,26 @@ pub async fn run(a: Args) -> Result<()> {
 
         bridge.disable();
 
-        shutdown.sleep(backoff).await;
+        // The old connection is already dead, even though the socket does not know it yet, so a
+        // local change during the backoff cuts it short rather than being noticed after it.
+        // Shutdown is an arm of its own, or a signal here would cost another dial first.
+        let woke = tokio::select! {
+            _ = shutdown.requested() => break,
+            _ = tokio::time::sleep(backoff) => None,
+            r = netlink.readable() => match r {
+                Ok(mut guard) => {
+                    let change = guard.get_inner().drain();
+                    guard.clear_ready();
+                    watch.network_changed(change)
+                }
+                Err(e) => {
+                    log::error!("netlink stopped: {e}");
+                    None
+                }
+            },
+        };
         backoff = (backoff * 2).min(BACKOFF_MAX);
-        // The old connection is already dead, even though the socket does not know it yet.
-        if let Some(reason) = watch.poll() {
+        if let Some(reason) = woke.or_else(|| watch.resumed()) {
             log::info!("{}, reconnecting now", reason.as_str());
             backoff = BACKOFF_MIN;
         }
@@ -97,6 +119,7 @@ async fn session(
     addr: SocketAddr,
     shutdown: &mut Shutdown,
     watch: &mut wake::Watch,
+    netlink: &mut tokio::io::unix::AsyncFd<wake::Monitor>,
 ) -> Result<Ended> {
     let s = control::dial(addr).await?;
     log::info!(
@@ -117,7 +140,6 @@ async fn session(
     // Reads `/proc/net/tcp`, so it is on a timer rather than on every wakeup.
     let mut probe = tokio::time::interval(control::PING_INTERVAL);
     let mut resolve = tokio::time::interval(ENDPOINT_REFRESH);
-    let mut network = tokio::time::interval(WATCH_POLL);
     resolve.reset();
 
     loop {
@@ -152,6 +174,11 @@ async fn session(
             }
             // On its own timer: gating it on having received something deadlocks two idle peers.
             _ = tokio::time::sleep_until(heartbeat.next_wake().into()) => {
+                // Suspend detection rides here rather than on a timer of its own: this arm fires
+                // at least every thirty seconds, and nothing is in flight across a suspend anyway.
+                if let Some(reason) = watch.resumed() {
+                    bail!("{}", reason.as_str());
+                }
                 match heartbeat.tick(Instant::now()) {
                     control::Beat::Ping => wire::write(&mut writer, &Msg::Ping).await?,
                     control::Beat::Expired => {
@@ -160,8 +187,11 @@ async fn session(
                     control::Beat::Wait => {}
                 }
             }
-            _ = network.tick() => {
-                if let Some(reason) = watch.poll() {
+            r = netlink.readable() => {
+                let mut guard = r.context("waiting on netlink")?;
+                let change = guard.get_inner().drain();
+                guard.clear_ready();
+                if let Some(reason) = watch.network_changed(change) {
                     bail!("{}", reason.as_str());
                 }
             }
@@ -192,7 +222,7 @@ impl Bridge {
 
 pub struct Attach {
     pub target_v4: Ipv4Addr,
-    /// `None` on the shipped client, where `connect6` then declines rather than rewriting to `::`.
+    /// `None` leaves `connect6` declining rather than rewriting to `::`.
     pub target_v6: Option<Ipv6Addr>,
     pub syncnt: u8,
     pub port_lo: u16,
@@ -225,10 +255,10 @@ impl Attach {
 impl Bridge {
     /// Starts disabled with an empty range, so before the control connection is up the machine
     /// behaves exactly as if needlecast were not installed.
-    pub fn attach(target_v4: Ipv4Addr, syncnt: u8) -> Result<Self> {
+    pub fn attach(target_v4: Ipv4Addr, target_v6: Option<Ipv6Addr>, syncnt: u8) -> Result<Self> {
         Self::attach_with(Attach {
             target_v4,
-            target_v6: None,
+            target_v6,
             syncnt,
             port_lo: 0,
             port_hi: 0,

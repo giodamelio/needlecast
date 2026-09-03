@@ -39,12 +39,13 @@ def tc_counters():
 def tc_delta(before, key):
     return tc_counters().get(key, 0) - before.get(key, 0)
 
-def start_datapath():
+def start_datapath(v6=False, extra=""):
     desktop.succeed("rm -f /run/needlecast/server.ready")
+    v6_flags = f"--transport-v6 {DESKTOP6} --transport-peer-v6 {LAPTOP6} " if v6 else ""
     desktop.succeed(
         "systemd-run --unit=ncdatapath --collect "
         f"needlecast harness datapath --iface {IFACE} --transport-v4 {DESKTOP} "
-        f"--transport-peer-v4 {LAPTOP} "
+        f"--transport-peer-v4 {LAPTOP} {v6_flags}{extra} "
         "--port-lo 8000 --port-hi 8999"
     )
     try:
@@ -286,3 +287,102 @@ with subtest("final tc counter snapshot"):
     connect(PORT)
     print(desktop.succeed("needlecast dev tc-counters"))
     print(desktop.succeed("cat /tmp/sysctl-findings"))
+
+
+# --------------------------------------------------------------------------------------------
+# IPv6. The question the whole v6 datapath turns on: `ip6_rcv_core` drops any packet whose
+# destination is `::1` unless it arrived on a loopback device, and there is no `route_localnet`
+# to switch that off. Both endings are measured here rather than argued from the source.
+# --------------------------------------------------------------------------------------------
+
+def connect6(port, extra="", host=None):
+    host = host or DESKTOP6
+    return parse(laptop.succeed(
+        f"nc-probe connect --host {host} --port {port} --v6 {extra} || true"
+    ))
+
+with subtest("v6 setup: the transport carries IPv6 and a ::1-bound server is unreachable"):
+    stop_datapath()
+    for m in (laptop, desktop):
+        m.wait_until_succeeds(f"ip -6 addr show {IFACE} | grep -q 'inet6 fd7c'", timeout=60)
+    laptop.wait_until_succeeds(f"ping -6 -c1 -W2 {DESKTOP6}", timeout=60)
+    serve("dev6", "::1", 8084, "desktop-v6", "--v6")
+    desktop.wait_until_succeeds("ss -lnt | grep -q '8084'", timeout=30)
+    r = connect6(8084)
+    assert r.get("error") in ("ECONNREFUSED", "TIMEOUT"), r
+    print(f"v6 baseline failure mode: {r}")
+
+# The negative control. Without it, "the redirect is what makes v6 work" would be an argument.
+with subtest("Rung A fails for v6: rewriting the destination is not enough"):
+    start_datapath(v6=True, extra="--no-v6-redirect")
+    before = tc_counters()
+    r = connect6(8084)
+    assert r.get("data") != "desktop-v6", f"delivered without the redirect: {r}"
+    print(f"v6 without the redirect: {r}")
+    # The program did its work; the kernel dropped the result.
+    assert tc_delta(before, "tc_ingress.rewritten_tcp") >= 1, tc_counters()
+    assert tc_delta(before, "tc_ingress.redirected") == 0, tc_counters()
+    stop_datapath()
+
+with subtest("Rung C works for v6: the packet is handed to lo and delivered"):
+    start_datapath(v6=True)
+    before = tc_counters()
+    r = connect6(8084)
+    assert r.get("data") == "desktop-v6", r
+    assert tc_delta(before, "tc_ingress.rewritten_tcp") >= 1, tc_counters()
+    assert tc_delta(before, "tc_ingress.redirected") >= 1, tc_counters()
+    assert tc_delta(before, "tc_egress.rewritten_tcp") >= 1, tc_counters()
+    assert tc_delta(before, "tc_ingress.redirect_err") == 0, tc_counters()
+
+with subtest("and it costs no sysctl, unlike v4"):
+    # There is no v6 `route_localnet` to set, and nothing else was needed either.
+    for key in ("net.ipv6.conf.all.forwarding",
+                "net.ipv6.conf.lo.forwarding",
+                f"net.ipv6.conf.{IFACE}.forwarding"):
+        print(f"{key}={desktop.succeed(f'sysctl -n {key}').strip()}")
+    assert "clsact" not in desktop.succeed("tc qdisc show dev lo")
+
+with subtest("the v6 server sees a genuine loopback connection"):
+    serve("dev6b", "::1", 8085, "desktop-v6b", "--v6 --hold 60")
+    desktop.wait_until_succeeds("ss -lnt | grep -q '8085'", timeout=30)
+    laptop.succeed(
+        f"setsid nc-probe connect --host {DESKTOP6} --port 8085 --v6 --hold 30 "
+        "> /tmp/hold6.out 2>&1 &"
+    )
+    laptop.wait_until_succeeds("grep -q '^data=' /tmp/hold6.out", timeout=30)
+    desktop.wait_until_succeeds(
+        "ss -tn state established | grep -q ':8085'", timeout=30
+    )
+    established = desktop.succeed("ss -tn state established | grep ':8085'")
+    print(established)
+    assert "::1" in established, established
+
+with subtest("v6 out of range is untouched"):
+    serve("dev6c", "::1", OUT_OF_RANGE, "unmanaged6", "--v6")
+    desktop.wait_until_succeeds(f"ss -lnt | grep -q '{OUT_OF_RANGE}'", timeout=30)
+    before = tc_counters()
+    r = connect6(OUT_OF_RANGE)
+    assert r.get("data") != "unmanaged6", r
+    assert tc_delta(before, "tc_ingress.port_out_of_range") >= 1, tc_counters()
+
+with subtest("v6 bulk and UDP survive the checksum rewrite"):
+    desktop.succeed("head -c 20000000 /dev/urandom > /tmp/blob6.bin")
+    want6 = desktop.succeed("sha256sum /tmp/blob6.bin").split()[0]
+    serve("dev6d", "::1", 8086, "unused", "--v6 --file /tmp/blob6.bin")
+    desktop.wait_until_succeeds("ss -lnt | grep -q '8086'", timeout=30)
+    r = parse(laptop.succeed(
+        f"nc-probe connect --host {DESKTOP6} --port 8086 --v6 --out /tmp/blob6 --timeout 300"
+    ))
+    assert int(r["bytes"]) == 20000000, r
+    assert laptop.succeed("sha256sum /tmp/blob6").split()[0] == want6, "v6 TCP checksum"
+
+    serve("dev6e", "::1", 8087, "udp-desktop6", "--v6 --udp")
+    desktop.wait_until_succeeds("ss -lnu | grep -q '8087'", timeout=30)
+    r = connect6(8087, "--udp --unconnected")
+    assert r.get("data", "").startswith("udp-desktop6"), r
+    # Fragmented: the v6 offset field is packed differently from v4's, and only this notices.
+    r = connect6(8087, f"--udp --unconnected --payload-size {MTU * 4} --timeout 30")
+    assert r.get("echo_ok") == "True", f"v6 fragment handling: {r}"
+
+with subtest("final v6 tc counter snapshot"):
+    print(desktop.succeed("needlecast dev tc-counters"))

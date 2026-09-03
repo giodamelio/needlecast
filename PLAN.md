@@ -224,8 +224,9 @@ Phase 4 is the same test with one variable changed. Run with
 - [ ] `tcpdump -vv` checksum inspection. Skipped deliberately: on `lo` and for locally generated
       packets, `CHECKSUM_PARTIAL` makes tcpdump report false "incorrect" verdicts, so it would be a
       flaky assertion. The hash-identical transfer is the real test.
-- [ ] IPv6 on the desktop datapath. The tc programs count v6 packets and pass them through
-      untouched; there is no v6 rewrite path yet.
+- [x] IPv6 on the desktop datapath. Delivery needs `bpf_redirect(lo, BPF_F_INGRESS)`, because
+      `ip6_rcv_core` drops a loopback destination on any non-loopback device and there is no v6
+      `route_localnet`. Measured both ways — see FINDINGS.md.
 
 ## Phase 4: Swap in real WireGuard
 
@@ -263,7 +264,7 @@ on the desktop outside the transport interface is touched.
       reply steered back out of loopback, which costs either a local-table route or a tc program on
       `lo`, and it forces a distinct peer address that is *almost* local rather than local.
 - [x] ~~Add a tc egress program on `lo`~~ — never worked, and ruled out by interface ownership.
-- [ ] `getpeername6` on the desktop, once the desktop datapath handles IPv6 at all.
+- [x] `getpeername6` on the desktop, now that the desktop datapath handles IPv6.
 
 ## Phase 6: Redirect inbound and drop the sysctls — rejected
 
@@ -408,13 +409,8 @@ Deliberately not built:
 
 - **A per-port allowlist.** [DESIGN.md](DESIGN.md) decides against it: the managed range is the only
   limit, and that is stated rather than hedged.
-- **IPv6 on the desktop datapath.** The tc programs count IPv6 and pass it through, and
-  `connect6` now *declines* rather than rewriting to the unspecified address when no v6 target is
-  configured. Room is reserved in `SleeveConfig`, in the tc counter indices, and in
-  `transport::Plan`, so adding it is new code rather than a layout change.
-- **A tracepoint-driven listener feed**, replacing the 250ms poll.
-- **A netlink monitor socket** for network-change detection; an address and route snapshot compared
-  on each loop tick is what is built.
+- **Anything else that polls.** Both 250ms polls are gone: the listener feed is four BPF hooks
+  pushing wakeups, and network-change detection is a netlink socket. See FINDINGS.md.
 
 Deleted rather than deferred:
 

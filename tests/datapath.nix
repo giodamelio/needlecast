@@ -40,6 +40,8 @@ in
       IFACE = "${t.iface}"
       LAPTOP = "${t.laptopAddr}"
       DESKTOP = "${t.desktopAddr}"
+      LAPTOP6 = "${t.laptopAddr6}"
+      DESKTOP6 = "${t.desktopAddr6}"
       MTU = ${toString t.mtu}
       ${builtins.readFile ./datapath.py}
     '';
