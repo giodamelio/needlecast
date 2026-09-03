@@ -106,12 +106,15 @@ in
           client.wait_until_succeeds(
               "needlecast dev show-config | grep -q 'enabled=0'", timeout=60
           )
-          start_server(server, peer="client")
-          # It cannot come back while the name resolves nowhere, which is what makes the recovery
-          # below attributable to re-resolution rather than retrying.
-          client.succeed("sleep 10")
+          # The endpoint moving is the thing being tested, and it is checked while the server is
+          # down: once it is back, its own handshake makes WireGuard roam the peer, which would
+          # restore the endpoint no matter whether needlecast ever re-resolved.
+          client.wait_until_succeeds(
+              f"wg show {IFACE} endpoints | grep -q 192.0.2.9", timeout=60
+          )
           assert parse(client.succeed("needlecast dev show-config")).get("enabled") == "0"
 
+          start_server(server, peer="client")
           client.succeed("umount /etc/hosts")
           client.succeed("systemctl restart nscd.service || true")
           client.wait_until_succeeds(f"getent ahostsv4 server | grep -q {real}", timeout=60)
